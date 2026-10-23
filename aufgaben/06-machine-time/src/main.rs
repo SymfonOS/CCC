@@ -115,6 +115,8 @@ struct Geometry {
     ray: Vec<Vec<Vec<u16>>>, // ray[emitter][ring position] -> hit cells
     pat: Vec<u16>,           // pattern cell ids
     pat_idx: Vec<i32>,       // cell id -> index in pat, or -1
+    f_idx: Vec<i32>,         // cell id -> index among forbidden cells, or -1
+    nf: usize,
     forbidden: Vec<bool>,    // non-pattern cells adjacent to the pattern
     ncell: usize,
     dd: Vec<u8>,             // dd[(e * n + pos) * np + pi]: ticks until emitter e is aligned with pattern cell pi
@@ -182,7 +184,15 @@ fn geometry(r: usize, pattern: &[Vec<u8>]) -> Geometry {
             }
         }
     }
-    Geometry { n, ray, pat, pat_idx, forbidden, ncell, dd }
+    let mut f_idx = vec![-1i32; ncell];
+    let mut nf = 0;
+    for c in 0..ncell {
+        if forbidden[c] {
+            f_idx[c] = nf as i32;
+            nf += 1;
+        }
+    }
+    Geometry { n, ray, pat, pat_idx, f_idx, nf, forbidden, ncell, dd }
 }
 
 /// Build the pattern `k` times using only the emitter pair (a, b).
@@ -314,11 +324,14 @@ fn plan(g: &Geometry, r: usize, a: usize, b: usize, k: u32) -> Option<Vec<[u8; 6
 
 const NW: usize = 5;
 
+const NJ: usize = 4;
+
 #[derive(Clone, Copy)]
 struct St {
     pos: [u8; 6],
     act: u8,
     have: [u64; NW],
+    junk: [u64; NJ], // forbidden cells currently holding matter
 }
 
 fn popcount(h: &[u64; NW]) -> usize {
@@ -343,6 +356,8 @@ fn potential(g: &Geometry, st: &St) -> i64 {
 }
 
 thread_local! {
+    static NOISE: i64 = env_num("NOISE", 0);
+    static SEED: u64 = env_num("SEED", 0) as u64;
     static POT_MODE: i64 = env_num("POT", 0);
     static HAVE_W: i64 = env_num("HAVE_W", 100_000);
 }
@@ -352,29 +367,27 @@ fn potential_mode(g: &Geometry, st: &St, mode: i64) -> i64 {
     let n = g.n;
     let rows: [&[u8]; 6] = std::array::from_fn(|e| &g.dd[(e * n + st.pos[e] as usize) * np..][..np]);
     let off: [u8; 6] = std::array::from_fn(|e| ((st.act >> e) & 1 == 0) as u8);
-    let mut total = 0i64;
+    let mut hist = [0u32; 64];
     for pi in 0..np {
         if (st.have[pi / 64] >> (pi % 64)) & 1 != 0 {
             continue;
         }
+        // three smallest of the six alignment distances (branchless insertion)
         let (mut m1, mut m2, mut m3) = (u8::MAX, u8::MAX, u8::MAX);
         for e in 0..6 {
             let v = rows[e][pi].saturating_add(off[e]);
-            if v < m1 {
-                m3 = m2;
-                m2 = m1;
-                m1 = v;
-            } else if v < m2 {
-                m3 = m2;
-                m2 = v;
-            } else if v < m3 {
-                m3 = v;
-            }
+            let lo1 = m1.min(v);
+            let hi1 = m1.max(v);
+            let lo2 = m2.min(hi1);
+            let hi2 = m2.max(hi1);
+            m3 = m3.min(hi2);
+            m1 = lo1;
+            m2 = lo2;
         }
-        let d = if m3 == 0 { 3 } else { m2 as i64 };
-        total += weight(d, mode);
+        let d = if m3 == 0 { 3 } else { m2.min(63) };
+        hist[d as usize] += 1;
     }
-    total
+    hist.iter().enumerate().map(|(d, &c)| c as i64 * weight(d as i64, mode)).sum()
 }
 
 fn hash_state(st: &St) -> u64 {
@@ -391,6 +404,9 @@ fn hash_state(st: &St) -> u64 {
     for w in st.have {
         mix(w);
     }
+    for w in st.junk {
+        mix(w);
+    }
     h
 }
 
@@ -402,7 +418,9 @@ fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]
     }
     let n = g.n;
     let h = home(r);
-    let mut cur = St { pos: std::array::from_fn(|e| h[e] as u8), act: 0, have: [0; NW] };
+    let mut cur = St { pos: std::array::from_fn(|e| h[e] as u8), act: 0, have: [0; NW], junk: [0; NJ] };
+    // JW > 0: matter on forbidden cells is allowed temporarily (penalty JW each) and must be destroyed again
+    let jw = if g.nf <= NJ * 64 { env_num("JW", 0) } else { 0 };
     // moves: up to `movers` emitters act; op 0=F 1=B 2=T, 3 = idle
     let movers: usize = std::env::var("MOVERS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
     let mut moves: Vec<[u8; 6]> = Vec::new();
@@ -422,6 +440,15 @@ fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]
         }
     }
     let hw = HAVE_W.with(|w| *w);
+    let noise = NOISE.with(|v| *v);
+    // deterministic per-pattern random stream (xorshift)
+    let mut rng: u64 = SEED.with(|v| *v).wrapping_mul(0x9E3779B97F4A7C15) ^ (np as u64 * 0x632BE59BD9B4E019) ^ g.pat[0] as u64 ^ 0xA5A5_5A5A;
+    let mut rand = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
     let mut cnt = vec![0u8; g.ncell];
     let mut touched: Vec<u16> = Vec::new();
     let mut prog: Vec<[u8; 6]> = Vec::new();
@@ -463,13 +490,22 @@ fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]
                         let v = cnt[c as usize];
                         if v == 2 {
                             if g.forbidden[c as usize] {
-                                ok = false;
+                                if jw == 0 {
+                                    ok = false;
+                                } else {
+                                    let f = g.f_idx[c as usize] as usize;
+                                    ns.junk[f / 64] |= 1 << (f % 64);
+                                }
                             }
                             let i = g.pat_idx[c as usize];
                             if i >= 0 {
                                 ns.have[i as usize / 64] |= 1 << (i as usize % 64);
                             }
                         } else if v >= 3 {
+                            if jw != 0 && g.forbidden[c as usize] {
+                                let f = g.f_idx[c as usize] as usize;
+                                ns.junk[f / 64] &= !(1 << (f % 64));
+                            }
                             let i = g.pat_idx[c as usize];
                             if i >= 0 {
                                 ns.have[i as usize / 64] &= !(1 << (i as usize % 64));
@@ -482,14 +518,23 @@ fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]
                     }
                     let line: [u8; 6] = std::array::from_fn(|e| INSTR[mv[e] as usize]);
                     let have = popcount(&ns.have);
-                    if have == np {
+                    let junk: usize = ns.junk.iter().map(|w| w.count_ones() as usize).sum();
+                    if have == np && junk == 0 {
                         let mut fresh = ns;
                         fresh.have = [0; NW];
                         finished.push((-potential(g, &fresh), bi as u32, line, ns));
                         continue;
                     }
-                    let score = have as i64 * hw + potential(g, &ns);
+                    let mut score = have as i64 * hw - junk as i64 * jw + potential(g, &ns);
+                    if noise > 0 {
+                        score += (rand() % noise as u64) as i64;
+                    }
                     cands.push((score, bi as u32, line, ns));
+                    if cands.len() >= 8 * width + 4096 {
+                        let keep = 3 * width;
+                        cands.select_nth_unstable_by(keep, |a, b| b.0.cmp(&a.0));
+                        cands.truncate(keep);
+                    }
                 }
             }
             if !finished.is_empty() {
@@ -529,7 +574,364 @@ fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]
     Some(prog)
 }
 
-fn generate(r: usize, pattern: &[Vec<u8>], k: u32) -> Vec<[u8; 6]> {
+/// Ticks at which the pattern is submitted (stops after `limit` submissions).
+fn submissions(r: usize, pattern: &[Vec<u8>], prog: &[[u8; 6]], limit: usize) -> Vec<usize> {
+    let mut grid = empty_board(r);
+    let cells: Vec<(i64, i64)> = pattern
+        .iter()
+        .enumerate()
+        .flat_map(|(y, row)| row.iter().enumerate().filter(|(_, &c)| c == b'M').map(move |(x, _)| (y as i64, x as i64)))
+        .collect();
+    let in_pattern = |y: i64, x: i64| get(pattern, y, x) == b'M';
+    let ring = ring(r);
+    let n = ring.len();
+    let mut idx = home(r);
+    let mut active = [false; 6];
+    let mut subs = Vec::new();
+    let w = grid[0].len();
+    let mut hits = vec![0u8; grid.len() * w];
+    let mut touched: Vec<(usize, usize)> = Vec::new();
+    for (t, line) in prog.iter().enumerate() {
+        for e in 0..6 {
+            match line[e] {
+                b'F' => idx[e] = (idx[e] + 1) % n,
+                b'B' => idx[e] = (idx[e] + n - 1) % n,
+                b'T' => active[e] = !active[e],
+                _ => {}
+            }
+        }
+        touched.clear();
+        for e in 0..6 {
+            if !active[e] {
+                continue;
+            }
+            let (mut y, mut x) = ring[idx[e]];
+            let (dy, dx) = DIRS[e];
+            loop {
+                y += dy;
+                x += dx;
+                let c = get(&grid, y, x);
+                if c != b'O' && c != b'M' {
+                    break;
+                }
+                let k = y as usize * w + x as usize;
+                if hits[k] == 0 {
+                    touched.push((y as usize, x as usize));
+                }
+                hits[k] += 1;
+            }
+        }
+        for &(y, x) in &touched {
+            let k = y * w + x;
+            match hits[k] {
+                2 => grid[y][x] = b'M',
+                3.. => grid[y][x] = b'O',
+                _ => {}
+            }
+            hits[k] = 0;
+        }
+        if cells.is_empty() || !cells.iter().all(|&(y, x)| get(&grid, y, x) == b'M') {
+            continue;
+        }
+        let clean = cells.iter().all(|&(y, x)| {
+            NEIGHBORS
+                .iter()
+                .all(|&(dy, dx)| get(&grid, y + dy, x + dx) != b'M' || in_pattern(y + dy, x + dx))
+        });
+        if clean {
+            for &(y, x) in &cells {
+                grid[y as usize][x as usize] = b'O';
+            }
+            subs.push(t);
+            if subs.len() >= limit {
+                break;
+            }
+        }
+    }
+    subs
+}
+
+/// Local search on a finished program: delete lines or merge neighbouring lines
+/// as long as the program still submits the pattern `k` times.
+fn polish(r: usize, pattern: &[Vec<u8>], k: u32, mut prog: Vec<[u8; 6]>) -> Vec<[u8; 6]> {
+    let k = k as usize;
+    let fits = |p: &[[u8; 6]]| -> Option<usize> {
+        let s = submissions(r, pattern, p, k);
+        (s.len() == k).then(|| s[k - 1] + 1)
+    };
+    let mut improved = true;
+    while improved {
+        improved = false;
+        let mut t = 0;
+        while t < prog.len() {
+            // try deleting line t
+            let mut cand = prog.clone();
+            cand.remove(t);
+            if let Some(len) = fits(&cand) {
+                cand.truncate(len);
+                prog = cand;
+                improved = true;
+                continue;
+            }
+            // try merging line t with line t+1 (disjoint emitters)
+            if t + 1 < prog.len() && (0..6).all(|e| prog[t][e] == b'-' || prog[t + 1][e] == b'-') {
+                let mut cand = prog.clone();
+                let next = cand.remove(t + 1);
+                for e in 0..6 {
+                    if next[e] != b'-' {
+                        cand[t][e] = next[e];
+                    }
+                }
+                if let Some(len) = fits(&cand) {
+                    cand.truncate(len);
+                    prog = cand;
+                    improved = true;
+                    continue;
+                }
+            }
+            t += 1;
+        }
+    }
+    prog
+}
+
+fn parse_programs(text: &str) -> Vec<Vec<[u8; 6]>> {
+    text.trim_matches('\n')
+        .split("\n\n")
+        .map(|b| {
+            b.lines()
+                .map(|l| {
+                    let t: Vec<u8> = l.split_whitespace().map(|x| x.as_bytes()[0]).collect();
+                    std::array::from_fn(|e| t[e])
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Exact search for a building cycle of length <= 2 (line-space enumeration).
+/// Returns (length, configs) where a config gives per emitter `None` (off) or a ring position.
+fn min_cycle(r: usize, pattern: &[Vec<u8>]) -> Option<(usize, Vec<[Option<u8>; 6]>)> {
+    let g = geometry(r, pattern);
+    let np = g.pat.len();
+    if np > 64 || g.nf > 128 {
+        return None;
+    }
+    let pmask: u64 = if np == 64 { u64::MAX } else { (1u64 << np) - 1 };
+    let fmask: u128 = if g.nf == 128 { u128::MAX } else { (1u128 << g.nf) - 1 };
+    // useful ring positions per emitter and their hit masks
+    let mut useful: Vec<Vec<u8>> = vec![Vec::new(); 6];
+    let mut pm: Vec<Vec<u64>> = vec![Vec::new(); 6];
+    let mut fm: Vec<Vec<u128>> = vec![Vec::new(); 6];
+    for e in 0..6 {
+        for p in 0..g.n {
+            if g.ray[e][p].is_empty() {
+                continue;
+            }
+            let (mut a, mut b) = (0u64, 0u128);
+            for &c in &g.ray[e][p] {
+                let i = g.pat_idx[c as usize];
+                if i >= 0 {
+                    a |= 1 << i;
+                }
+                let f = g.f_idx[c as usize];
+                if f >= 0 {
+                    b |= 1 << f;
+                }
+            }
+            useful[e].push(p as u8);
+            pm[e].push(a);
+            fm[e].push(b);
+        }
+    }
+    #[derive(Clone, Copy, Default)]
+    struct Planes {
+        p1: u64,
+        p2: u64,
+        p3: u64,
+        f1: u128,
+        f2: u128,
+        f3: u128,
+    }
+    fn add(pl: Planes, a: u64, b: u128) -> Planes {
+        Planes {
+            p3: pl.p3 | (pl.p2 & a),
+            p2: (pl.p2 & !a) | (pl.p1 & a),
+            p1: (pl.p1 & !a) | (!(pl.p1 | pl.p2 | pl.p3) & a),
+            f3: pl.f3 | (pl.f2 & b),
+            f2: (pl.f2 & !b) | (pl.f1 & b),
+            f1: (pl.f1 & !b) | (!(pl.f1 | pl.f2 | pl.f3) & b),
+        }
+    }
+    // value per emitter: 0 = off, v>0 = useful[e][v-1]
+    let sizes: Vec<usize> = (0..6).map(|e| useful[e].len() + 1).collect();
+    let to_cfg = |vals: &[usize; 6]| -> [Option<u8>; 6] {
+        std::array::from_fn(|e| if vals[e] == 0 { None } else { Some(useful[e][vals[e] - 1]) })
+    };
+    // enumerate C2
+    let mut vals = [0usize; 6];
+    let mut best1: Option<[usize; 6]> = None;
+    let mut best2: Option<([usize; 6], [usize; 6])> = None;
+    fn rec(
+        e: usize,
+        pl: Planes,
+        vals: &mut [usize; 6],
+        sizes: &[usize],
+        pm: &[Vec<u64>],
+        fm: &[Vec<u128>],
+        visit: &mut dyn FnMut(&[usize; 6], Planes) -> bool,
+    ) -> bool {
+        if e == 6 {
+            return visit(vals, pl);
+        }
+        for v in 0..sizes[e] {
+            vals[e] = v;
+            let npl = if v == 0 { pl } else { add(pl, pm[e][v - 1], fm[e][v - 1]) };
+            if npl.p3 & !0 != 0 && false {
+                continue;
+            }
+            if rec(e + 1, npl, vals, sizes, pm, fm, visit) {
+                return true;
+            }
+        }
+        false
+    }
+    let mut c2_list: Vec<([usize; 6], u64, u64)> = Vec::new(); // (vals, created P, triple P|F irrelevant)
+    let mut c2_triple_f: Vec<u128> = Vec::new();
+    {
+        let mut visit = |v: &[usize; 6], pl: Planes| -> bool {
+            if pl.f2 & fmask != 0 || pl.p3 & pmask != 0 {
+                return false;
+            }
+            if pl.p2 & pmask == pmask {
+                best1 = Some(*v);
+                return true;
+            }
+            let rem = pmask & !pl.p2;
+            if rem.count_ones() <= 12 {
+                c2_list.push((*v, pl.p2 & pmask, rem));
+                c2_triple_f.push(pl.f3);
+            }
+            false
+        };
+        rec(0, Planes::default(), &mut vals, &sizes, &pm, &fm, &mut visit);
+    }
+    if let Some(v) = best1 {
+        return Some((1, vec![to_cfg(&v)]));
+    }
+    // L = 2: C1 adjacent to C2 covers the rest; its forbidden matter must be destroyed by C2
+    c2_list.sort_by_key(|c| c.2.count_ones());
+    'outer: for (ci, &(v2, _, rem)) in c2_list.iter().enumerate() {
+        let f3 = c2_triple_f[ci];
+        // options for C1 per emitter
+        let opts: Vec<Vec<usize>> = (0..6)
+            .map(|e| {
+                if v2[e] == 0 {
+                    (0..sizes[e]).collect()
+                } else {
+                    let mut o = vec![0, v2[e]];
+                    if v2[e] > 1 {
+                        o.push(v2[e] - 1);
+                    }
+                    if v2[e] + 1 < sizes[e] {
+                        o.push(v2[e] + 1);
+                    }
+                    o
+                }
+            })
+            .collect();
+        let mut v1 = [0usize; 6];
+        fn rec1(
+            e: usize,
+            pl: Planes,
+            v1: &mut [usize; 6],
+            opts: &[Vec<usize>],
+            pm: &[Vec<u64>],
+            fm: &[Vec<u128>],
+            rem: u64,
+            f3: u128,
+            fmask: u128,
+        ) -> bool {
+            if pl.p3 & rem != 0 {
+                return false;
+            }
+            if e == 6 {
+                return pl.p2 & rem == rem && (pl.f2 & fmask) & !f3 == 0;
+            }
+            for &v in &opts[e] {
+                v1[e] = v;
+                let npl = if v == 0 { pl } else { add(pl, pm[e][v - 1], fm[e][v - 1]) };
+                if rec1(e + 1, npl, v1, opts, pm, fm, rem, f3, fmask) {
+                    return true;
+                }
+            }
+            false
+        }
+        if rec1(0, Planes::default(), &mut v1, &opts, &pm, &fm, rem, f3, fmask) {
+            best2 = Some((v1, v2));
+            break 'outer;
+        }
+    }
+    best2.map(|(a, b)| (2, vec![to_cfg(&a), to_cfg(&b)]))
+}
+
+/// Program for a building cycle: move emitters into place (inactive), then repeat
+/// the cycle C1 -> C2 -> C1 -> ... ; every completed cycle submits one copy.
+fn cycle_program(r: usize, cfgs: &[[Option<u8>; 6]], k: u32) -> Vec<[u8; 6]> {
+    let n = 6 * r;
+    let h = home(r);
+    let first_on = |e: usize| cfgs.iter().find_map(|c| c[e]);
+    let step_dir = |from: usize, to: usize| -> u8 {
+        if (from + 1) % n == to {
+            b'F'
+        } else if (to + 1) % n == from {
+            b'B'
+        } else {
+            b'-'
+        }
+    };
+    // setup moves
+    let mut moves: Vec<Vec<u8>> = vec![Vec::new(); 6];
+    for e in 0..6 {
+        if let Some(t) = first_on(e) {
+            let t = t as usize;
+            let fwd = (t + n - h[e]) % n;
+            if fwd <= n - fwd {
+                moves[e] = vec![b'F'; fwd];
+            } else {
+                moves[e] = vec![b'B'; n - fwd];
+            }
+        }
+    }
+    let d = moves.iter().map(Vec::len).max().unwrap_or(0);
+    let mut prog: Vec<[u8; 6]> = (0..d).map(|i| std::array::from_fn(|e| *moves[e].get(i).unwrap_or(&b'-'))).collect();
+    // activation line = first config of the cycle
+    let c1 = cfgs[0];
+    prog.push(std::array::from_fn(|e| if c1[e].is_some() { b'T' } else { b'-' }));
+    let trans = |a: &[Option<u8>; 6], b: &[Option<u8>; 6]| -> [u8; 6] {
+        std::array::from_fn(|e| match (a[e], b[e]) {
+            (Some(x), Some(y)) => step_dir(x as usize, y as usize),
+            (None, None) => b'-',
+            _ => b'T',
+        })
+    };
+    if cfgs.len() == 1 {
+        for _ in 1..k {
+            prog.push([b'-'; 6]);
+        }
+    } else {
+        let fwd = trans(&cfgs[0], &cfgs[1]);
+        let back = trans(&cfgs[1], &cfgs[0]);
+        prog.push(fwd);
+        for _ in 1..k {
+            prog.push(back);
+            prog.push(fwd);
+        }
+    }
+    prog
+}
+
+fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]> {
     let g = geometry(r, pattern);
     let mut best: Option<Vec<[u8; 6]>> = None;
     for a in 0..6 {
@@ -541,7 +943,14 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32) -> Vec<[u8; 6]> {
             }
         }
     }
-    let width: usize = std::env::var("BEAM").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    if width > 0 && g.pat.len() <= 30 && r <= 6 {
+        if let Some((_, cfgs)) = min_cycle(r, pattern) {
+            let p = cycle_program(r, &cfgs, k);
+            if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
+                best = Some(p);
+            }
+        }
+    }
     if width > 0 {
         if let Some(p) = plan_beam(&g, r, k, width) {
             if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
@@ -573,30 +982,54 @@ fn parse(input: &str) -> Vec<Task> {
         .collect()
 }
 
-fn solve(input: &str) -> (String, usize) {
+fn solve(input: &str, existing: Option<Vec<Vec<[u8; 6]>>>) -> (String, usize) {
     let tasks = parse(input);
-    let progs: Vec<Vec<[u8; 6]>> = std::thread::scope(|s| {
-        let threads = 8;
-        let chunk = tasks.len().div_ceil(threads).max(1);
-        let handles: Vec<_> = tasks
-            .chunks(chunk)
-            .map(|c| {
-                s.spawn(move || {
-                    c.iter()
-                        .map(|t| {
-                            let p = generate(t.r, &t.pattern, t.k);
-                            assert_eq!(simulate(t.r, &t.pattern, &p), t.k, "verification failed");
-                            p
-                        })
-                        .collect::<Vec<_>>()
+    let polish_only = std::env::var("POLISH").is_ok();
+    let width = env_num("BEAM", 16) as usize;
+    // SHARD=i/n: only tasks with index % n == i get the expensive beam search
+    let (shard, nshard) = std::env::var("SHARD")
+        .ok()
+        .and_then(|v| v.split_once('/').map(|(a, b)| (a.parse().unwrap_or(0), b.parse().unwrap_or(1))))
+        .unwrap_or((0usize, 1usize));
+    let limit = env_num("LIMIT", i64::MAX) as usize;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let mut progs: Vec<(usize, Vec<[u8; 6]>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(t) = tasks.get(i) else { break };
+                        let w = if i % nshard == shard && i < limit { width } else { 0 };
+                        let old = existing.as_ref().and_then(|e| e.get(i)).filter(|p| simulate(t.r, &t.pattern, p) == t.k);
+                        let mut p = match (polish_only, old) {
+                            (true, Some(o)) => o.clone(),
+                            (_, o) => {
+                                let g = generate(t.r, &t.pattern, t.k, w);
+                                match o {
+                                    Some(o) if o.len() < g.len() => o.clone(),
+                                    _ => g,
+                                }
+                            }
+                        };
+                        if w > 0 || polish_only {
+                            p = polish(t.r, &t.pattern, t.k, p);
+                        }
+                        assert_eq!(simulate(t.r, &t.pattern, &p), t.k, "verification failed");
+                        done.push((i, p));
+                    }
+                    done
                 })
             })
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
-    let total = progs.iter().map(Vec::len).sum();
+    progs.sort_by_key(|p| p.0);
+    let total = progs.iter().map(|p| p.1.len()).sum();
     let mut out = String::new();
-    for p in progs {
+    for (_, p) in progs {
         for line in p {
             let toks: Vec<String> = line.iter().map(|&c| (c as char).to_string()).collect();
             out += &toks.join(" ");
@@ -608,14 +1041,60 @@ fn solve(input: &str) -> (String, usize) {
 }
 
 fn main() {
+    if std::env::var("ANALYZE").is_ok() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("daten");
+        for f in ["in_level-6_2-medium.txt"] {
+            let tasks = parse(&fs::read_to_string(dir.join(f)).unwrap());
+            let (mut l1, mut l2, mut none, mut copies2) = (0, 0, 0, 0);
+            for t in tasks.iter().take(0) {
+                match min_cycle(t.r, &t.pattern) {
+                    Some((1, _)) => l1 += 1,
+                    Some((2, _)) => {
+                        l2 += 1;
+                        copies2 += t.k;
+                    }
+                    _ => none += 1,
+                }
+            }
+            println!("{f}: L=1: {l1}, L=2: {l2} (Kopien {copies2}), mehr: {none}");
+            let old = parse_programs(&fs::read_to_string(dir.join(f.replace("in_", "out_"))).unwrap());
+            let res: Vec<Option<usize>> = std::thread::scope(|sc| {
+                let hs: Vec<_> = tasks
+                    .chunks(tasks.len().div_ceil(4))
+                    .map(|c| sc.spawn(move || c.iter().map(|t| min_cycle(t.r, &t.pattern).map(|x| x.0)).collect::<Vec<_>>()))
+                    .collect();
+                hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            });
+            let mut agg = std::collections::BTreeMap::new();
+            for (i, t) in tasks.iter().enumerate() {
+                let key = res[i].unwrap_or(3);
+                let e = agg.entry(key).or_insert((0usize, 0usize, 0usize));
+                e.0 += 1;
+                e.1 += t.k as usize;
+                e.2 += old[i].len();
+            }
+            for (l, (cnt, copies, lines)) in agg {
+                println!("  L{}{}: Muster {cnt}, Kopien {copies}, Zeilen bisher {lines} ({:.2} pro Kopie)", if l == 3 { ">=" } else { "=" }, l, lines as f64 / copies as f64);
+            }
+        }
+        return;
+    }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("daten");
+    // OUT: output directory (default: daten), FILES: comma separated name filters
+    let out_dir = std::env::var("OUT").map(std::path::PathBuf::from).unwrap_or(dir.clone());
+    fs::create_dir_all(&out_dir).unwrap();
+    let filters: Vec<String> = std::env::var("FILES").map(|v| v.split(',').map(String::from).collect()).unwrap_or_default();
     let mut files: Vec<_> = fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
     files.sort();
     for p in files {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
+            continue;
+        }
         if let Some(rest) = name.strip_prefix("in_") {
-            let (res, total) = solve(&fs::read_to_string(&p).unwrap());
-            fs::write(dir.join(format!("out_{rest}")), res).unwrap();
+            let existing = fs::read_to_string(out_dir.join(format!("out_{rest}"))).ok().map(|t| parse_programs(&t));
+            let (res, total) = solve(&fs::read_to_string(&p).unwrap(), existing);
+            fs::write(out_dir.join(format!("out_{rest}")), res).unwrap();
             println!("{name}: ok, Zeilen gesamt = {total}");
         }
     }
@@ -629,7 +1108,7 @@ mod tests {
     fn beispiel_programme_sind_gueltig() {
         let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("daten");
         let inp = fs::read_to_string(d.join("in_level-6_0-example.txt")).unwrap();
-        let (_, total) = solve(&inp);
+        let (_, total) = solve(&inp, None);
         assert!(total > 0);
     }
 }
