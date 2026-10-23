@@ -381,25 +381,22 @@ fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]
     let n = g.n;
     let h = home(r);
     let mut cur = St { pos: std::array::from_fn(|e| h[e] as u8), act: 0, have: [0; NW] };
-    // moves: (emitter, op) for up to two emitters; op 0=F 1=B 2=T
-    let mut moves: Vec<[u8; 6]> = vec![[3; 6]];
-    for i in 0..6 {
-        for a in 0..3 {
-            let mut m = [3u8; 6];
-            m[i] = a;
-            moves.push(m);
-        }
-    }
-    for i in 0..6 {
-        for j in i + 1..6 {
-            for a in 0..3 {
-                for b in 0..3 {
-                    let mut m = [3u8; 6];
-                    m[i] = a;
-                    m[j] = b;
-                    moves.push(m);
-                }
+    // moves: up to `movers` emitters act; op 0=F 1=B 2=T, 3 = idle
+    let movers: usize = std::env::var("MOVERS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let mut moves: Vec<[u8; 6]> = Vec::new();
+    for code in 0..4usize.pow(6) {
+        let mut m = [3u8; 6];
+        let mut c = code;
+        let mut acting = 0;
+        for e in 0..6 {
+            m[e] = (c % 4) as u8;
+            c /= 4;
+            if m[e] != 3 {
+                acting += 1;
             }
+        }
+        if acting <= movers {
+            moves.push(m);
         }
     }
     let mut cnt = vec![0u8; g.ncell];
@@ -521,7 +518,7 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32) -> Vec<[u8; 6]> {
             }
         }
     }
-    let width: usize = std::env::var("BEAM").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let width: usize = std::env::var("BEAM").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     if width > 0 {
         if let Some(p) = plan_beam(&g, r, k, width) {
             if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {

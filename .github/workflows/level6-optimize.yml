@@ -1,0 +1,82 @@
+name: Level 6 optimieren
+
+# Startet bei Änderung von aufgaben/06-machine-time/opt.json oder manuell.
+# Jede Konfiguration [BEAM, MOVERS] läuft als eigener Job; danach wird pro Muster
+# das kürzeste (verifizierte) Programm übernommen und auf den Branch committet.
+on:
+  workflow_dispatch:
+    inputs:
+      configs:
+        description: "JSON-Liste [[BEAM, MOVERS], ...] (leer = opt.json)"
+        required: false
+        default: ""
+  push:
+    branches: [claude/loving-hopper-bxo06f]
+    paths: ["aufgaben/06-machine-time/opt.json"]
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        run: |
+          cfg='${{ github.event.inputs.configs }}'
+          [ -z "$cfg" ] && cfg=$(tr -d '\n ' < aufgaben/06-machine-time/opt.json)
+          echo "matrix=$cfg" >> "$GITHUB_OUTPUT"
+
+  run:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p machine-time
+      - name: Optimieren
+        env:
+          BEAM: ${{ matrix.cfg[0] }}
+          MOVERS: ${{ matrix.cfg[1] }}
+        run: |
+          echo "### BEAM=$BEAM MOVERS=$MOVERS" >> "$GITHUB_STEP_SUMMARY"
+          ./target/release/machine-time | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out-${{ matrix.cfg[0] }}-${{ matrix.cfg[1] }}
+          path: aufgaben/06-machine-time/daten/out_*.txt
+
+  merge:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/loving-hopper-bxo06f
+      - uses: actions/download-artifact@v4
+        with:
+          path: kandidaten
+          pattern: out-*
+      - name: Bestes Programm je Muster übernehmen
+        run: python3 aufgaben/06-machine-time/merge.py aufgaben/06-machine-time/daten kandidaten | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Commit und Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add aufgaben/06-machine-time/daten/out_*.txt
+          git diff --cached --quiet && exit 0
+          git commit -m "Level 6: optimierte Outputs aus GitHub Actions"
+          for i in 1 2 3 4; do
+            git pull --rebase origin claude/loving-hopper-bxo06f && git push origin HEAD:claude/loving-hopper-bxo06f && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
