@@ -1,0 +1,75 @@
+name: Level 6 CP-SAT Zyklen
+
+# Matrix aus cpsat/runs.json: [datei, shard, nshards, zeitlimit, lmax]
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/loving-hopper-bxo06f]
+    paths: ["aufgaben/06-machine-time/cpsat/runs.json"]
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        run: echo "matrix=$(tr -d '\n ' < aufgaben/06-machine-time/cpsat/runs.json)" >> "$GITHUB_OUTPUT"
+
+  run:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ortools
+      - name: Zyklen suchen
+        env:
+          SHARD: ${{ matrix.cfg[1] }}/${{ matrix.cfg[2] }}
+        working-directory: aufgaben/06-machine-time
+        run: |
+          mkdir -p ergebnis
+          cp daten/out_level-6_${{ matrix.cfg[0] }}.txt ergebnis/
+          python3 cpsat/cyclic.py daten/in_level-6_${{ matrix.cfg[0] }}.txt daten/out_level-6_${{ matrix.cfg[0] }}.txt ergebnis/out_level-6_${{ matrix.cfg[0] }}.txt ${{ matrix.cfg[3] }} ${{ matrix.cfg[4] }} 2 | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpsat-${{ strategy.job-index }}
+          path: aufgaben/06-machine-time/ergebnis/out_*.txt
+
+  merge:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/loving-hopper-bxo06f
+      - uses: actions/download-artifact@v4
+        with:
+          path: kandidaten
+          pattern: cpsat-*
+      - name: Bestes Programm je Muster übernehmen
+        run: python3 aufgaben/06-machine-time/merge.py aufgaben/06-machine-time/daten kandidaten | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Commit und Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add aufgaben/06-machine-time/daten/out_*.txt
+          git diff --cached --quiet && exit 0
+          git commit -m "Level 6: CP-SAT-Zyklen aus GitHub Actions"
+          for i in 1 2 3 4; do
+            git pull --rebase origin claude/loving-hopper-bxo06f && git push origin HEAD:claude/loving-hopper-bxo06f && exit 0
+            sleep $((i * 5))
+          done
+          exit 1

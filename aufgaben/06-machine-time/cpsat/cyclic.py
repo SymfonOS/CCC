@@ -219,6 +219,9 @@ def main():
         jobs.append((i, r, pat, k, olds[i], tl, lmax))
     # most valuable first: large K
     order = sorted(range(nprog), key=lambda i: -jobs[i][3])
+    # SHARD=i/n: only every n-th job (by value order) is solved here
+    sh = os.environ.get('SHARD', '0/1').split('/')
+    order = [i for j, i in enumerate(order) if j % int(sh[1]) == int(sh[0])]
     result = list(olds)
 
     def dump():
