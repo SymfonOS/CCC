@@ -117,6 +117,7 @@ struct Geometry {
     pat_idx: Vec<i32>,       // cell id -> index in pat, or -1
     forbidden: Vec<bool>,    // non-pattern cells adjacent to the pattern
     ncell: usize,
+    dd: Vec<u8>,             // dd[(e * n + pos) * np + pi]: ticks until emitter e is aligned with pattern cell pi
 }
 
 fn geometry(r: usize, pattern: &[Vec<u8>]) -> Geometry {
@@ -159,7 +160,29 @@ fn geometry(r: usize, pattern: &[Vec<u8>]) -> Geometry {
             }
         }
     }
-    Geometry { n, ray, pat, pat_idx, forbidden, ncell }
+    // ring position from which emitter e's beam passes through each cell
+    let mut origin = vec![vec![255u8; ncell]; 6];
+    for e in 0..6 {
+        for p in 0..n {
+            for &c in &ray[e][p] {
+                origin[e][c as usize] = p as u8;
+            }
+        }
+    }
+    let np = pat.len();
+    let mut dd = vec![99u8; 6 * n * np];
+    for e in 0..6 {
+        for pos in 0..n {
+            for (pi, &c) in pat.iter().enumerate() {
+                let o = origin[e][c as usize];
+                if o != 255 {
+                    let d = (pos as i64 - o as i64).unsigned_abs() as usize;
+                    dd[(e * n + pos) * np + pi] = d.min(n - d) as u8;
+                }
+            }
+        }
+    }
+    Geometry { n, ray, pat, pat_idx, forbidden, ncell, dd }
 }
 
 /// Build the pattern `k` times using only the emitter pair (a, b).
@@ -288,6 +311,204 @@ fn plan(g: &Geometry, r: usize, a: usize, b: usize, k: u32) -> Option<Vec<[u8; 6
     Some(prog)
 }
 
+
+const NW: usize = 5;
+
+#[derive(Clone, Copy)]
+struct St {
+    pos: [u8; 6],
+    act: u8,
+    have: [u64; NW],
+}
+
+fn popcount(h: &[u64; NW]) -> usize {
+    h.iter().map(|w| w.count_ones() as usize).sum()
+}
+
+fn potential(g: &Geometry, st: &St) -> i64 {
+    let np = g.pat.len();
+    let n = g.n;
+    let rows: [&[u8]; 6] = std::array::from_fn(|e| &g.dd[(e * n + st.pos[e] as usize) * np..][..np]);
+    let off: [u8; 6] = std::array::from_fn(|e| ((st.act >> e) & 1 == 0) as u8);
+    let mut total = 0i64;
+    for pi in 0..np {
+        if (st.have[pi / 64] >> (pi % 64)) & 1 != 0 {
+            continue;
+        }
+        let (mut m1, mut m2, mut m3) = (u8::MAX, u8::MAX, u8::MAX);
+        for e in 0..6 {
+            let v = rows[e][pi].saturating_add(off[e]);
+            if v < m1 {
+                m3 = m2;
+                m2 = m1;
+                m1 = v;
+            } else if v < m2 {
+                m3 = m2;
+                m2 = v;
+            } else if v < m3 {
+                m3 = v;
+            }
+        }
+        let d = if m3 == 0 { 3 } else { m2 as i64 };
+        total += 100 / ((1 + d) * (1 + d));
+    }
+    total
+}
+
+fn hash_state(st: &St) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= h >> 29;
+    };
+    for e in 0..6 {
+        mix(st.pos[e] as u64);
+    }
+    mix(st.act as u64);
+    for w in st.have {
+        mix(w);
+    }
+    h
+}
+
+/// Beam search over all six emitters; builds the pattern `k` times.
+fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]>> {
+    let np = g.pat.len();
+    if np > NW * 64 {
+        return None;
+    }
+    let n = g.n;
+    let h = home(r);
+    let mut cur = St { pos: std::array::from_fn(|e| h[e] as u8), act: 0, have: [0; NW] };
+    // moves: (emitter, op) for up to two emitters; op 0=F 1=B 2=T
+    let mut moves: Vec<[u8; 6]> = vec![[3; 6]];
+    for i in 0..6 {
+        for a in 0..3 {
+            let mut m = [3u8; 6];
+            m[i] = a;
+            moves.push(m);
+        }
+    }
+    for i in 0..6 {
+        for j in i + 1..6 {
+            for a in 0..3 {
+                for b in 0..3 {
+                    let mut m = [3u8; 6];
+                    m[i] = a;
+                    m[j] = b;
+                    moves.push(m);
+                }
+            }
+        }
+    }
+    let mut cnt = vec![0u8; g.ncell];
+    let mut touched: Vec<u16> = Vec::new();
+    let mut prog: Vec<[u8; 6]> = Vec::new();
+    for _ in 0..k {
+        cur.have = [0; NW];
+        let mut nodes: Vec<(u32, [u8; 6])> = vec![(u32::MAX, [b'-'; 6])];
+        let mut beam: Vec<(u32, St)> = vec![(0, cur)];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(hash_state(&cur));
+        let limit = 40 * np + 400;
+        let mut done: Option<(u32, St)> = None;
+        for _tick in 0..limit {
+            let mut cands: Vec<(i64, u32, [u8; 6], St)> = Vec::new();
+            let mut finished: Vec<(i64, u32, [u8; 6], St)> = Vec::new();
+            for (bi, (_, st)) in beam.iter().enumerate() {
+                for mv in &moves {
+                    let mut ns = *st;
+                    let mut ok = true;
+                    for e in 0..6 {
+                        match mv[e] {
+                            0 => ns.pos[e] = ((ns.pos[e] as usize + 1) % n) as u8,
+                            1 => ns.pos[e] = ((ns.pos[e] as usize + n - 1) % n) as u8,
+                            2 => ns.act ^= 1 << e,
+                            _ => {}
+                        }
+                    }
+                    touched.clear();
+                    for e in 0..6 {
+                        if (ns.act >> e) & 1 != 0 {
+                            for &c in &g.ray[e][ns.pos[e] as usize] {
+                                if cnt[c as usize] == 0 {
+                                    touched.push(c);
+                                }
+                                cnt[c as usize] += 1;
+                            }
+                        }
+                    }
+                    for &c in &touched {
+                        let v = cnt[c as usize];
+                        if v == 2 {
+                            if g.forbidden[c as usize] {
+                                ok = false;
+                            }
+                            let i = g.pat_idx[c as usize];
+                            if i >= 0 {
+                                ns.have[i as usize / 64] |= 1 << (i as usize % 64);
+                            }
+                        } else if v >= 3 {
+                            let i = g.pat_idx[c as usize];
+                            if i >= 0 {
+                                ns.have[i as usize / 64] &= !(1 << (i as usize % 64));
+                            }
+                        }
+                        cnt[c as usize] = 0;
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let line: [u8; 6] = std::array::from_fn(|e| INSTR[mv[e] as usize]);
+                    let have = popcount(&ns.have);
+                    if have == np {
+                        let mut fresh = ns;
+                        fresh.have = [0; NW];
+                        finished.push((-potential(g, &fresh), bi as u32, line, ns));
+                        continue;
+                    }
+                    let score = have as i64 * 100_000 + potential(g, &ns);
+                    cands.push((score, bi as u32, line, ns));
+                }
+            }
+            if !finished.is_empty() {
+                finished.sort_by_key(|f| f.0);
+                let (_, bi, line, ns) = finished[0];
+                nodes.push((beam[bi as usize].0, line));
+                done = Some(((nodes.len() - 1) as u32, ns));
+                break;
+            }
+            cands.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let mut next: Vec<(u32, St)> = Vec::with_capacity(width);
+            for (_, bi, line, ns) in cands {
+                if next.len() >= width {
+                    break;
+                }
+                if !visited.insert(hash_state(&ns)) {
+                    continue;
+                }
+                nodes.push((beam[bi as usize].0, line));
+                next.push(((nodes.len() - 1) as u32, ns));
+            }
+            if next.is_empty() {
+                return None;
+            }
+            beam = next;
+        }
+        let (mut node, ns) = done?;
+        let mut seq = Vec::new();
+        while node != 0 {
+            seq.push(nodes[node as usize].1);
+            node = nodes[node as usize].0;
+        }
+        seq.reverse();
+        prog.extend(seq);
+        cur = ns;
+    }
+    Some(prog)
+}
+
 fn generate(r: usize, pattern: &[Vec<u8>], k: u32) -> Vec<[u8; 6]> {
     let g = geometry(r, pattern);
     let mut best: Option<Vec<[u8; 6]>> = None;
@@ -297,6 +518,14 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32) -> Vec<[u8; 6]> {
                 if best.as_ref().map_or(true, |x| p.len() < x.len()) {
                     best = Some(p);
                 }
+            }
+        }
+    }
+    let width: usize = std::env::var("BEAM").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    if width > 0 {
+        if let Some(p) = plan_beam(&g, r, k, width) {
+            if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
+                best = Some(p);
             }
         }
     }
