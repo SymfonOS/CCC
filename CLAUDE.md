@@ -14,3 +14,15 @@ Der Nutzer schickt Aufgaben im Chat. Für jede Aufgabe gilt:
 5. **Fortschritt:** `STATUS.md` nach jeder Aufgabe aktualisieren, damit eine andere Session nahtlos weitermachen kann.
 
 Sprache mit dem Nutzer: Deutsch.
+
+## Große/lange Aufgaben: GitHub Actions nutzen (Token sparen)
+
+Bei großen oder rechenintensiven Aufgaben (lange Läufe, große Ausgaben, viele Tests) NICHT lokal
+ausführen und Ausgaben in den Chat holen, sondern:
+
+1. Lösung committen und pushen. Der Workflow `.github/workflows/aufgabe.yml` läuft bei Änderungen
+   unter `aufgaben/**` automatisch, oder manuell per `workflow_dispatch` (Input `aufgabe` = Ordnername).
+2. Ergebnis über die GitHub-MCP-Tools holen (`actions_list`, `actions_get`, `get_job_logs`),
+   nur den relevanten Ausschnitt lesen (Job-Summary / Artifact `ergebnis`), nie ganze Logs.
+3. Programme so schreiben, dass sie nur das Endergebnis ausgeben (kurze Ausgabe).
+4. Kleine Aufgaben weiterhin direkt lokal lösen.

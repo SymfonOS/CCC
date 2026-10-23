@@ -1,0 +1,49 @@
+name: Aufgabe ausführen
+
+on:
+  workflow_dispatch:
+    inputs:
+      aufgabe:
+        description: "Ordnername unter aufgaben/ (z. B. 01-beispiel)"
+        required: true
+      args:
+        description: "Optionale Argumente für das Programm"
+        required: false
+        default: ""
+  push:
+    branches: [claude/loving-hopper-bxo06f]
+    paths: ["aufgaben/**"]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Aufgaben bestimmen
+        id: sel
+        run: |
+          if [ -n "${{ github.event.inputs.aufgabe }}" ]; then
+            echo "list=${{ github.event.inputs.aufgabe }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "list=$(git diff --name-only HEAD~1 HEAD -- aufgaben | cut -d/ -f2 | sort -u | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bauen, testen, ausführen
+        run: |
+          mkdir -p ergebnis
+          for a in ${{ steps.sel.outputs.list }}; do
+            [ -f "aufgaben/$a/Cargo.toml" ] || continue
+            echo "## $a" >> "$GITHUB_STEP_SUMMARY"
+            cargo test --release -p "$a" 2>&1 | tail -n 20
+            cargo run --release -p "$a" -- ${{ github.event.inputs.args }} > "ergebnis/$a.txt" 2>&1 || true
+            { echo '```'; head -c 4000 "ergebnis/$a.txt"; echo; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ergebnis
+          path: ergebnis/
