@@ -4,6 +4,7 @@ use std::{fs, path::Path};
 
 mod segment;
 mod extbeam;
+mod splice;
 
 const DIRS: [(i64, i64); 6] = [(0, 2), (1, 1), (1, -1), (0, -2), (-1, -1), (-1, 1)];
 const NEIGHBORS: [(i64, i64); 6] = [(0, 2), (0, -2), (1, 1), (1, -1), (-1, 1), (-1, -1)];
