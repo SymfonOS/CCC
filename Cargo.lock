@@ -7,6 +7,10 @@ name = "first-light"
 version = "0.1.0"
 
 [[package]]
+name = "machine-time"
+version = "0.1.0"
+
+[[package]]
 name = "nanofabricator"
 version = "0.1.0"
 
