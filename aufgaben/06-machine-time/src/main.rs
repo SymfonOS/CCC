@@ -1197,7 +1197,8 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]>
             }
         }
     }
-    if width > 0 && g.pat.len() <= 30 && r <= 6 {
+    let only_ext = std::env::var("ONLYEXT").is_ok();
+    if width > 0 && !only_ext && g.pat.len() <= 30 && r <= 6 {
         if let Some((_, cfgs)) = min_cycle(r, pattern) {
             let p = cycle_program(r, &cfgs, k);
             if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
@@ -1205,7 +1206,7 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]>
             }
         }
     }
-    if width > 0 {
+    if width > 0 && !only_ext {
         if let Some(p) = plan_beam(&g, r, k, width) {
             if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
                 best = Some(p);
@@ -1213,7 +1214,7 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]>
         }
     }
     // SEG=0 disables the segment search (free start, forward/backward walks)
-    if width > 0 && k >= 2 && env_num("SEG", 1) != 0 {
+    if width > 0 && !only_ext && k >= 2 && env_num("SEG", 1) != 0 {
         if let Some(p) = segment::segment_program(&g, r, pattern, k, width) {
             if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
                 best = Some(p);
@@ -1224,7 +1225,7 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]>
         }
     }
     let extw = env_num("EXTW", 0) as usize;
-    if extw > 0 {
+    if extw > 0 && width > 0 {
         let params = extbeam::Params {
             width: extw,
             wa: env_num("WA", 100),
