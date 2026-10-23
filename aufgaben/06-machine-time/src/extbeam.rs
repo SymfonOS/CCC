@@ -31,6 +31,18 @@ pub struct Params {
     pub maxt: usize,
 }
 
+/// Continue from the state after `prefix`; returns prefix + new tail.
+pub fn plan_from(g: &Geometry, r: usize, k: u32, p: &Params, prefix: &[[u8; 6]]) -> Option<Vec<[u8; 6]>> {
+    let tail = plan_inner(g, r, k, p, prefix)?;
+    let mut out = prefix.to_vec();
+    out.extend(tail);
+    Some(out)
+}
+
+pub fn plan(g: &Geometry, r: usize, k: u32, p: &Params) -> Option<Vec<[u8; 6]>> {
+    plan_inner(g, r, k, p, &[])
+}
+
 fn compact(cand: &mut Vec<Ch>, width: usize, hs: &mut Vec<u64>) -> i64 {
     cand.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(a.h.cmp(&b.h)));
     hs.iter_mut().for_each(|x| *x = 0);
@@ -65,7 +77,7 @@ fn compact(cand: &mut Vec<Ch>, width: usize, hs: &mut Vec<u64>) -> i64 {
     }
 }
 
-pub fn plan(g: &Geometry, r: usize, k: u32, p: &Params) -> Option<Vec<[u8; 6]>> {
+fn plan_inner(g: &Geometry, r: usize, k: u32, p: &Params, prefix: &[[u8; 6]]) -> Option<Vec<[u8; 6]>> {
     // relevant cells: pattern + forbidden
     let mut rel = vec![usize::MAX; g.ncell];
     let mut nrel = 0;
@@ -110,7 +122,53 @@ pub fn plan(g: &Geometry, r: usize, k: u32, p: &Params) -> Option<Vec<[u8; 6]>> 
         rng ^= rng << 17;
         rng
     };
-    let mut cur: Vec<S2> = vec![S2 { m: [0; NWM], o: [r as u8; 6], act: 0, subs: 0 }];
+    let mut start = S2 { m: [0; NWM], o: [r as u8; 6], act: 0, subs: 0 };
+    for line in prefix {
+        let (mut p1, mut p2, mut p3) = ([0u64; NWM], [0u64; NWM], [0u64; NWM]);
+        for e in 0..6 {
+            match line[e] {
+                b'F' => {
+                    if start.o[e] as usize + 1 >= no {
+                        return None;
+                    }
+                    start.o[e] += 1
+                }
+                b'B' => {
+                    if start.o[e] == 0 {
+                        return None;
+                    }
+                    start.o[e] -= 1
+                }
+                b'T' => start.act ^= 1 << e,
+                _ => {}
+            }
+            if (start.act >> e) & 1 != 0 {
+                let b = &bm[e][start.o[e] as usize];
+                for w in 0..nw {
+                    p3[w] |= p2[w] & b[w];
+                    p2[w] |= p1[w] & b[w];
+                    p1[w] |= b[w];
+                }
+            }
+        }
+        let mut full = true;
+        for w in 0..nw {
+            start.m[w] = (start.m[w] | (p2[w] & !p3[w])) & !p3[w];
+            if start.m[w] & pat[w] != pat[w] || start.m[w] & halo[w] != 0 {
+                full = false;
+            }
+        }
+        if full {
+            start.subs += 1;
+            for w in 0..nw {
+                start.m[w] &= !pat[w];
+            }
+        }
+    }
+    if start.subs as u32 >= k {
+        return None;
+    }
+    let mut cur: Vec<S2> = vec![start];
     let cap = p.width * 8 + 4096;
     let mut cand: Vec<Ch> = Vec::with_capacity(cap);
     let mut hs = vec![0u64; p.width * 4 + 7];

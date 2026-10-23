@@ -1185,6 +1185,34 @@ fn reoptimize(r: usize, pattern: &[Vec<u8>], k: u32, prog: Vec<[u8; 6]>, width: 
     best
 }
 
+/// Re-plan program tails with the whole-program beam from several cut points.
+fn reopt_ext(r: usize, pattern: &[Vec<u8>], k: u32, prog: Vec<[u8; 6]>, width: usize) -> Vec<[u8; 6]> {
+    let g = geometry(r, pattern);
+    let params = extbeam::Params {
+        width,
+        wa: env_num("WA", 100),
+        wd: env_num("WD", 30),
+        noise: env_num("NZ", 0) as u64,
+        seed: env_num("SEED", 0) as u64,
+        maxt: env_num("MAXT", 600) as usize,
+    };
+    let step = env_num("CUTSTEP", 2).max(1) as usize;
+    let mut best = prog.clone();
+    let mut t = prog.len().saturating_sub(1);
+    loop {
+        if let Some(cand) = extbeam::plan_from(&g, r, k, &params, &prog[..t]) {
+            if cand.len() < best.len() && simulate(r, pattern, &cand) == k {
+                best = cand;
+            }
+        }
+        if t < step {
+            break;
+        }
+        t -= step;
+    }
+    best
+}
+
 fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]> {
     let g = geometry(r, pattern);
     let mut best: Option<Vec<[u8; 6]>> = None;
@@ -1308,6 +1336,10 @@ fn solve(input: &str, existing: Option<Vec<Vec<[u8; 6]>>>) -> (String, usize) {
                                 }
                             }
                         };
+                        let rew = env_num("REOPT2", 0) as usize;
+                        if w > 0 && rew > 0 {
+                            p = reopt_ext(t.r, &t.pattern, t.k, p, rew);
+                        }
                         if w > 0 && std::env::var("REOPT").is_ok() {
                             p = reoptimize(t.r, &t.pattern, t.k, p, w);
                         }
