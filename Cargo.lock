@@ -11,5 +11,9 @@ name = "nanofabricator"
 version = "0.1.0"
 
 [[package]]
+name = "six-on-the-rail"
+version = "0.1.0"
+
+[[package]]
 name = "two-beams"
 version = "0.1.0"
