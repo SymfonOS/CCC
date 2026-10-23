@@ -12,7 +12,7 @@ on:
         default: ""
   push:
     branches: [claude/loving-hopper-bxo06f]
-    paths: ["aufgaben/**"]
+    paths: ["aufgaben/**", "!aufgaben/06-machine-time/**"]
 
 jobs:
   run:
