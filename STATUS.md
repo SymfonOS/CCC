@@ -8,5 +8,6 @@ Branch: `claude/loving-hopper-bxo06f`
 | 2 | Cloudflight Nanofabricator, Level 2 "First Light" (Laserstrahl simulieren) | nein | fertig, Beispiel byte-genau gleich | `aufgaben/02-first-light/` (Outputs: `daten/out_*.txt`) |
 | 3 | Cloudflight Nanofabricator, Level 3 "Two beams build, three beams burn" (mehrere Emitter, Materie erzeugen/zerstören) | nein | fertig, Beispiel byte-genau gleich | `aufgaben/03-two-beams/` (Outputs: `daten/out_*.txt`) |
 | 4 | Cloudflight Nanofabricator, Level 4 "Six on the Rail" (6 Emitter-Programme simulieren) | nein | fertig, Beispiel byte-genau gleich | `aufgaben/04-six-on-the-rail/` (Outputs: `daten/out_*.txt`) |
+| 5 | Cloudflight Nanofabricator, Level 5 "The Picky Arm" (Muster erkennen und zählen) | nein | fertig, Beispiel byte-genau gleich | `aufgaben/05-picky-arm/` (Outputs: `daten/out_*.txt`) |
 
-Nächster Schritt: Nutzer schickt weitere Aufgaben (z. B. Level 5), Vorgehen siehe `CLAUDE.md`.
+Nächster Schritt: Nutzer schickt weitere Aufgaben (z. B. Level 6), Vorgehen siehe `CLAUDE.md`.
