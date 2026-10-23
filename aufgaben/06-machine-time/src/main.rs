@@ -998,6 +998,18 @@ fn parse(input: &str) -> Vec<Task> {
 fn solve(input: &str, existing: Option<Vec<Vec<[u8; 6]>>>) -> (String, usize) {
     let tasks = parse(input);
     let polish_only = std::env::var("POLISH").is_ok();
+    if std::env::var("VERIFY").is_ok() {
+        let ex = existing.expect("keine Programme zum Prüfen");
+        let bad: Vec<usize> = tasks
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| ex.get(*i).map_or(true, |p| simulate(t.r, &t.pattern, p) != t.k))
+            .map(|(i, _)| i)
+            .collect();
+        let total = ex.iter().map(Vec::len).sum();
+        println!("ungültig: {} {:?}", bad.len(), &bad[..bad.len().min(10)]);
+        return (String::new(), total);
+    }
     let width = env_num("BEAM", 16) as usize;
     // SHARD=i/n: only tasks with index % n == i get the expensive beam search
     let (shard, nshard) = std::env::var("SHARD")
@@ -1107,7 +1119,9 @@ fn main() {
         if let Some(rest) = name.strip_prefix("in_") {
             let existing = fs::read_to_string(out_dir.join(format!("out_{rest}"))).ok().map(|t| parse_programs(&t));
             let (res, total) = solve(&fs::read_to_string(&p).unwrap(), existing);
-            fs::write(out_dir.join(format!("out_{rest}")), res).unwrap();
+            if std::env::var("VERIFY").is_err() {
+                fs::write(out_dir.join(format!("out_{rest}")), res).unwrap();
+            }
             println!("{name}: ok, Zeilen gesamt = {total}");
         }
     }
