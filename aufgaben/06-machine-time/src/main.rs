@@ -1,5 +1,7 @@
 use std::{fs, path::Path};
 
+mod segment;
+
 const DIRS: [(i64, i64); 6] = [(0, 2), (1, 1), (1, -1), (0, -2), (-1, -1), (-1, 1)];
 const NEIGHBORS: [(i64, i64); 6] = [(0, 2), (0, -2), (1, 1), (1, -1), (-1, 1), (-1, -1)];
 const INSTR: [u8; 4] = [b'F', b'B', b'T', b'-'];
@@ -956,6 +958,17 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]>
             if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
                 best = Some(p);
             }
+        }
+    }
+    // SEG=0 disables the segment search (free start, forward/backward walks)
+    if width > 0 && k >= 2 && env_num("SEG", 1) != 0 {
+        if let Some(p) = segment::segment_program(&g, r, pattern, k, width) {
+            if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
+                best = Some(p);
+            }
+        }
+        if let Some(p) = best.as_ref().and_then(|b| segment::reuse_best_copy(r, pattern, k, b)) {
+            best = Some(p);
         }
     }
     best.expect("no program found")
