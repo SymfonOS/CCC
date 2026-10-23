@@ -125,7 +125,9 @@ def solve_cyclic(r, pat, L, time_limit, workers=2, nsub=1):
     s.parameters.num_workers = workers
     st = s.Solve(m)
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        solve_cyclic.last_status = 'INFEASIBLE' if st == cp_model.INFEASIBLE else 'UNKNOWN'
         return None
+    solve_cyclic.last_status = 'OK'
     cfgs = []
     for t in range(L):
         row = []
@@ -189,13 +191,20 @@ def work(args):
     best = old
     pcur = period_of(r, pat, old, k)
     info = ''
-    for per in range(1, min(lmax, pcur - 1) + 1):
+    nsubs = (1, 2, 3) if os.environ.get('NSUB3') else (1, 2)
+    only_last = os.environ.get('ONLYLAST')  # only try per = pcur-1 (hunt for unknowns)
+    pers = [pcur - 1] if only_last and pcur >= 2 else range(1, min(lmax, pcur - 1) + 1)
+    for per in pers:
         if per * k >= len(best):
             break
         found = False
-        for nsub in (1, 2):
+        for nsub in nsubs:
+            if per * nsub > 3 * lmax:
+                continue
             sol = solve_cyclic(r, pat, per * nsub, tl, nsub=nsub)
             if sol is None:
+                if solve_cyclic.last_status == 'UNKNOWN':
+                    info += f' [per={per} nsub={nsub} UNKNOWN]'
                 continue
             found = True
             prog = build_program(r, sol[1], k, pat)
@@ -247,6 +256,8 @@ def main():
             done += 1
             if info:
                 print(f"{i}: k={jobs[i][3]} alt={len(olds[i])} neu={len(best)}{info}", flush=True)
+            elif os.environ.get('VERBOSE'):
+                print(f"{i}: k={jobs[i][3]} alt={len(olds[i])} bewiesen", flush=True)
             if done % 10 == 0:
                 dump()
     dump()
