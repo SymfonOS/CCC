@@ -414,13 +414,20 @@ fn hash_state(st: &St) -> u64 {
 
 /// Beam search over all six emitters; builds the pattern `k` times.
 fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]>> {
+    plan_beam_from(g, r, k, width, None)
+}
+
+/// Like `plan_beam`, but optionally continues from a given state (positions, active flags,
+/// pattern cells already built for the first copy).
+fn plan_beam_from(g: &Geometry, r: usize, k: u32, width: usize, start: Option<St>) -> Option<Vec<[u8; 6]>> {
     let np = g.pat.len();
     if np > NW * 64 {
         return None;
     }
     let n = g.n;
     let h = home(r);
-    let mut cur = St { pos: std::array::from_fn(|e| h[e] as u8), act: 0, have: [0; NW], junk: [0; NJ] };
+    let mut cur = start.unwrap_or(St { pos: std::array::from_fn(|e| h[e] as u8), act: 0, have: [0; NW], junk: [0; NJ] });
+    let keep_first = start.is_some();
     // JW > 0: matter on forbidden cells is allowed temporarily (penalty JW each) and must be destroyed again
     let jw = if g.nf <= NJ * 64 { env_num("JW", 0) } else { 0 };
     // moves: up to `movers` emitters act; op 0=F 1=B 2=T, 3 = idle
@@ -454,8 +461,10 @@ fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]
     let mut cnt = vec![0u8; g.ncell];
     let mut touched: Vec<u16> = Vec::new();
     let mut prog: Vec<[u8; 6]> = Vec::new();
-    for _ in 0..k {
-        cur.have = [0; NW];
+    for copy in 0..k {
+        if copy > 0 || !keep_first {
+            cur.have = [0; NW];
+        }
         let mut nodes: Vec<(u32, [u8; 6])> = vec![(u32::MAX, [b'-'; 6])];
         let mut beam: Vec<(u32, St)> = vec![(0, cur)];
         let mut visited = std::collections::HashSet::new();
@@ -933,6 +942,91 @@ fn cycle_program(r: usize, cfgs: &[[Option<u8>; 6]], k: u32) -> Vec<[u8; 6]> {
     prog
 }
 
+/// Simulate a program prefix; returns (search state, submissions so far) or None if
+/// forbidden cells hold matter (the beam search cannot continue from such states).
+fn state_after(r: usize, pattern: &[Vec<u8>], g: &Geometry, prog: &[[u8; 6]]) -> Option<(St, usize)> {
+    let mut grid = empty_board(r);
+    let ring = ring(r);
+    let n = ring.len();
+    let w = grid[0].len();
+    let mut idx = home(r);
+    let mut active = [false; 6];
+    let mut subs = 0;
+    let cells: Vec<usize> = g.pat.iter().map(|&c| c as usize).collect();
+    for line in prog {
+        for e in 0..6 {
+            match line[e] {
+                b'F' => idx[e] = (idx[e] + 1) % n,
+                b'B' => idx[e] = (idx[e] + n - 1) % n,
+                b'T' => active[e] = !active[e],
+                _ => {}
+            }
+        }
+        let mut hits = vec![0u8; grid.len() * w];
+        for e in 0..6 {
+            if active[e] {
+                for &c in &g.ray[e][idx[e]] {
+                    hits[c as usize] += 1;
+                }
+            }
+        }
+        for (c, &h) in hits.iter().enumerate() {
+            match h {
+                2 => grid[c / w][c % w] = b'M',
+                3.. => grid[c / w][c % w] = b'O',
+                _ => {}
+            }
+        }
+        let full = cells.iter().all(|&c| grid[c / w][c % w] == b'M');
+        let clean = (0..g.ncell).all(|c| !g.forbidden[c] || grid[c / w][c % w] != b'M');
+        if full && clean {
+            for &c in &cells {
+                grid[c / w][c % w] = b'O';
+            }
+            subs += 1;
+        }
+    }
+    if (0..g.ncell).any(|c| g.forbidden[c] && grid[c / w][c % w] == b'M') {
+        return None;
+    }
+    let mut have = [0u64; NW];
+    for (i, &c) in cells.iter().enumerate() {
+        if grid[c / w][c % w] == b'M' {
+            have[i / 64] |= 1 << (i % 64);
+        }
+    }
+    let act = (0..6).fold(0u8, |a, e| a | ((active[e] as u8) << e));
+    Some((St { pos: std::array::from_fn(|e| idx[e] as u8), act, have, junk: [0; NJ] }, subs))
+}
+
+/// Re-plan the tail of a program from several cut points; keeps the shortest valid result.
+fn reoptimize(r: usize, pattern: &[Vec<u8>], k: u32, prog: Vec<[u8; 6]>, width: usize) -> Vec<[u8; 6]> {
+    let g = geometry(r, pattern);
+    if g.pat.len() > NW * 64 {
+        return prog;
+    }
+    let step = env_num("CUTSTEP", 1).max(1) as usize;
+    let mut best = prog.clone();
+    let mut t = 0;
+    while t < prog.len() {
+        if let Some((st, subs)) = state_after(r, pattern, &g, &prog[..t]) {
+            if subs < k as usize {
+                if let Some(tail) = plan_beam_from(&g, r, k - subs as u32, width, Some(st)) {
+                    if t + tail.len() < best.len() {
+                        let mut cand = prog[..t].to_vec();
+                        cand.extend(tail);
+                        if simulate(r, pattern, &cand) == k {
+                            best = cand;
+                        }
+                    }
+                }
+            }
+        }
+        t += step;
+    }
+    best
+}
+
 fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]> {
     let g = geometry(r, pattern);
     let mut best: Option<Vec<[u8; 6]>> = None;
@@ -1039,6 +1133,9 @@ fn solve(input: &str, existing: Option<Vec<Vec<[u8; 6]>>>) -> (String, usize) {
                                 }
                             }
                         };
+                        if w > 0 && std::env::var("REOPT").is_ok() {
+                            p = reoptimize(t.r, &t.pattern, t.k, p, w);
+                        }
                         if w > 0 || polish_only {
                             p = polish(t.r, &t.pattern, t.k, p);
                         }
