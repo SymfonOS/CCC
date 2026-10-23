@@ -9,3 +9,7 @@ version = "0.1.0"
 [[package]]
 name = "nanofabricator"
 version = "0.1.0"
+
+[[package]]
+name = "two-beams"
+version = "0.1.0"
