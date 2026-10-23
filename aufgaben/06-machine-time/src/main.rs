@@ -1314,6 +1314,13 @@ fn solve(input: &str, existing: Option<Vec<Vec<[u8; 6]>>>) -> (String, usize) {
                         if w > 0 || polish_only {
                             p = polish(t.r, &t.pattern, t.k, p);
                         }
+                        if polish_only {
+                            if let Some(q) = segment::reuse_best_copy(t.r, &t.pattern, t.k, &p) {
+                                if q.len() < p.len() && simulate(t.r, &t.pattern, &q) == t.k {
+                                    p = q;
+                                }
+                            }
+                        }
                         assert_eq!(simulate(t.r, &t.pattern, &p), t.k, "verification failed");
                         done.push((i, p));
                     }
