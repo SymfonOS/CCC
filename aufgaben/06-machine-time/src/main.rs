@@ -1378,6 +1378,72 @@ fn solve(input: &str, existing: Option<Vec<Vec<[u8; 6]>>>) -> (String, usize) {
 }
 
 fn main() {
+    // SPLICE mode: CANDS=dir1:dir2:... (searched recursively for out_level-6_*.txt), OUT=target dir
+    if let Ok(cands) = std::env::var("CANDS") {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("daten");
+        let out_dir = std::env::var("OUT").map(std::path::PathBuf::from).unwrap_or(dir.clone());
+        let filters: Vec<String> = std::env::var("FILES").map(|v| v.split(',').map(String::from).collect()).unwrap_or_default();
+        fn walk(d: &Path, name: &str, acc: &mut Vec<std::path::PathBuf>) {
+            if let Ok(rd) = fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, name, acc);
+                    } else if p.file_name().map_or(false, |f| f == name) {
+                        acc.push(p);
+                    }
+                }
+            }
+        }
+        let mut files: Vec<_> = fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+        files.sort();
+        for p in files {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix("in_") else { continue };
+            if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
+                continue;
+            }
+            let tasks = parse(&fs::read_to_string(&p).unwrap());
+            let out_name = format!("out_{rest}");
+            let mut best = parse_programs(&fs::read_to_string(out_dir.join(&out_name)).unwrap());
+            assert_eq!(best.len(), tasks.len());
+            let mut cand_files = Vec::new();
+            for d in cands.split(':') {
+                walk(Path::new(d), &out_name, &mut cand_files);
+            }
+            let mut pool: Vec<Vec<Vec<[u8; 6]>>> = Vec::new();
+            for f in &cand_files {
+                if let Ok(t) = fs::read_to_string(f) {
+                    let progs = parse_programs(&t);
+                    if progs.len() == tasks.len() && progs.iter().all(|p| p.iter().all(|l| l.iter().all(|&c| b"FBT-".contains(&c)))) {
+                        pool.push(progs);
+                    }
+                }
+            }
+            let before: usize = best.iter().map(Vec::len).sum();
+            let mut improved = 0;
+            for (i, t) in tasks.iter().enumerate() {
+                let cs: Vec<&[[u8; 6]]> = pool.iter().map(|p| p[i].as_slice()).chain(std::iter::once(best[i].as_slice())).collect();
+                if let Some(p) = splice::splice(t.r, &t.pattern, t.k, &cs, best[i].len()) {
+                    improved += 1;
+                    best[i] = p;
+                }
+            }
+            let after: usize = best.iter().map(Vec::len).sum();
+            let mut out = String::new();
+            for p in &best {
+                for line in p {
+                    let toks: Vec<String> = line.iter().map(|&c| (c as char).to_string()).collect();
+                    out += &toks.join(" ");
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+            fs::write(out_dir.join(&out_name), out).unwrap();
+            println!("{name}: {} Kandidatendateien, {improved} Muster verbessert, {before} -> {after}", pool.len());
+        }
+        return;
+    }
     if std::env::var("ANALYZE2").is_ok() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("daten");
         let f = std::env::var("ANALYZE2").unwrap();
