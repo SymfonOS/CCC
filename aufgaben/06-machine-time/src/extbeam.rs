@@ -29,6 +29,9 @@ pub struct Params {
     pub noise: u64,
     pub seed: u64,
     pub maxt: usize,
+    pub pcap: usize, // >0: keep at most this many candidates per parent state
+    pub hp: i64,     // >0: matter on halo cells is penalised (hp per cell) instead of forbidden
+    pub ae: bool,    // allow >=3 hits on already painted pattern cells (erase)
 }
 
 /// Continue from the state after `prefix`; returns prefix + new tail.
@@ -177,7 +180,18 @@ fn plan_inner(g: &Geometry, r: usize, k: u32, p: &Params, prefix: &[[u8; 6]]) ->
     for _t in 0..p.maxt {
         cand.clear();
         let mut thr = i64::MIN;
+        let mut loc: Vec<Ch> = Vec::new();
         'parents: for (pi, s) in cur.iter().enumerate() {
+            if p.pcap > 0 && !loc.is_empty() {
+                if loc.len() > p.pcap {
+                    loc.select_nth_unstable_by(p.pcap, |a, b| b.score.cmp(&a.score));
+                    loc.truncate(p.pcap);
+                }
+                cand.extend(loc.drain(..));
+                if cand.len() >= cap {
+                    thr = compact(&mut cand, p.width, &mut hs);
+                }
+            }
             let mut un = [0u64; NWM];
             for w in 0..nw {
                 un[w] = pat[w] & !s.m[w];
@@ -247,7 +261,7 @@ fn plan_inner(g: &Geometry, r: usize, k: u32, p: &Params, prefix: &[[u8; 6]]) ->
                         c3[l + 1][w] = c3[l][w] | (c2[l][w] & x);
                         c2[l + 1][w] = c2[l][w] | (c1[l][w] & x);
                         c1[l + 1][w] = c1[l][w] | x;
-                        if c3[l + 1][w] & s.m[w] & pat[w] != 0 {
+                        if !p.ae && c3[l + 1][w] & s.m[w] & pat[w] != 0 {
                             bad = true;
                         }
                     }
@@ -268,7 +282,7 @@ fn plan_inner(g: &Geometry, r: usize, k: u32, p: &Params, prefix: &[[u8; 6]]) ->
                 let mut bad = false;
                 for w in 0..nw {
                     let ex2 = c2[6][w] & !c3[6][w];
-                    if ex2 & halo[w] != 0 {
+                    if p.hp == 0 && ex2 & halo[w] != 0 {
                         bad = true;
                         break;
                     }
@@ -300,7 +314,8 @@ fn plan_inner(g: &Geometry, r: usize, k: u32, p: &Params, prefix: &[[u8; 6]]) ->
                     break 'parents;
                 }
                 let painted: i64 = (0..nw).map(|w| (nm[w] & pat[w]).count_ones() as i64).sum();
-                let mut sc = subs as i64 * 10_000_000 + painted * p.wa - sd * p.wd;
+                let hm: i64 = (0..nw).map(|w| (nm[w] & halo[w]).count_ones() as i64).sum();
+                let mut sc = subs as i64 * 10_000_000 + painted * p.wa - sd * p.wd - hm * p.hp;
                 if p.noise > 0 {
                     sc += (xr() % p.noise) as i64;
                 }
@@ -314,7 +329,12 @@ fn plan_inner(g: &Geometry, r: usize, k: u32, p: &Params, prefix: &[[u8; 6]]) ->
                 }
                 hsh ^= subs as u64;
                 hsh = hsh.wrapping_mul(1099511628211);
-                cand.push(Ch { score: sc, h: hsh, par: pi as u32, code });
+                let ch = Ch { score: sc, h: hsh, par: pi as u32, code };
+                if p.pcap > 0 {
+                    loc.push(ch);
+                    continue;
+                }
+                cand.push(ch);
                 if cand.len() >= cap {
                     thr = compact(&mut cand, p.width, &mut hs);
                 }
@@ -323,6 +343,13 @@ fn plan_inner(g: &Geometry, r: usize, k: u32, p: &Params, prefix: &[[u8; 6]]) ->
         if let Some(f) = found {
             hist.push(vec![f]);
             break;
+        }
+        if !loc.is_empty() {
+            if loc.len() > p.pcap {
+                loc.select_nth_unstable_by(p.pcap, |a, b| b.score.cmp(&a.score));
+                loc.truncate(p.pcap);
+            }
+            cand.extend(loc.drain(..));
         }
         compact(&mut cand, p.width, &mut hs);
         if cand.is_empty() {

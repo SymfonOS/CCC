@@ -1196,6 +1196,9 @@ fn reopt_ext(r: usize, pattern: &[Vec<u8>], k: u32, prog: Vec<[u8; 6]>, width: u
         noise: env_num("NZ", 0) as u64,
         seed: env_num("SEED", 0) as u64,
         maxt: env_num("MAXT", 600) as usize,
+        pcap: env_num("PCAP", 0) as usize,
+        hp: env_num("HP", 0),
+        ae: env_num("AE", 0) != 0,
     };
     let step = env_num("CUTSTEP", 2).max(1) as usize;
     let mut best = prog.clone();
@@ -1262,6 +1265,9 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]>
             noise: env_num("NZ", 0) as u64,
             seed: env_num("SEED", 0) as u64,
             maxt: env_num("MAXT", 600) as usize,
+            pcap: env_num("PCAP", 0) as usize,
+            hp: env_num("HP", 0),
+            ae: env_num("AE", 0) != 0,
         };
         if let Some(p) = extbeam::plan(&g, r, k, &params) {
             if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
