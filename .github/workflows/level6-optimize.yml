@@ -46,12 +46,14 @@ jobs:
         env:
           BEAM: ${{ matrix.cfg[0] }}
           MOVERS: ${{ matrix.cfg[1] }}
+          HAVE_W: ${{ matrix.cfg[2] }}
+          POT: ${{ matrix.cfg[3] }}
         run: |
-          echo "### BEAM=$BEAM MOVERS=$MOVERS" >> "$GITHUB_STEP_SUMMARY"
+          echo "### BEAM=$BEAM MOVERS=$MOVERS HAVE_W=$HAVE_W POT=$POT" >> "$GITHUB_STEP_SUMMARY"
           ./target/release/machine-time | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: out-${{ matrix.cfg[0] }}-${{ matrix.cfg[1] }}
+          name: out-${{ strategy.job-index }}
           path: aufgaben/06-machine-time/daten/out_*.txt
 
   merge:

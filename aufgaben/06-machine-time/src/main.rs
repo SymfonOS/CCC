@@ -325,7 +325,29 @@ fn popcount(h: &[u64; NW]) -> usize {
     h.iter().map(|w| w.count_ones() as usize).sum()
 }
 
+fn env_num(name: &str, default: i64) -> i64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Weight of a missing pattern cell that is `d` ticks away from being creatable.
+fn weight(d: i64, mode: i64) -> i64 {
+    match mode {
+        1 => 100 / (1 + d),
+        2 => 100 >> d.min(20),
+        _ => 100 / ((1 + d) * (1 + d)),
+    }
+}
+
 fn potential(g: &Geometry, st: &St) -> i64 {
+    potential_mode(g, st, POT_MODE.with(|m| *m))
+}
+
+thread_local! {
+    static POT_MODE: i64 = env_num("POT", 0);
+    static HAVE_W: i64 = env_num("HAVE_W", 100_000);
+}
+
+fn potential_mode(g: &Geometry, st: &St, mode: i64) -> i64 {
     let np = g.pat.len();
     let n = g.n;
     let rows: [&[u8]; 6] = std::array::from_fn(|e| &g.dd[(e * n + st.pos[e] as usize) * np..][..np]);
@@ -350,7 +372,7 @@ fn potential(g: &Geometry, st: &St) -> i64 {
             }
         }
         let d = if m3 == 0 { 3 } else { m2 as i64 };
-        total += 100 / ((1 + d) * (1 + d));
+        total += weight(d, mode);
     }
     total
 }
@@ -399,6 +421,7 @@ fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]
             moves.push(m);
         }
     }
+    let hw = HAVE_W.with(|w| *w);
     let mut cnt = vec![0u8; g.ncell];
     let mut touched: Vec<u16> = Vec::new();
     let mut prog: Vec<[u8; 6]> = Vec::new();
@@ -465,7 +488,7 @@ fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]
                         finished.push((-potential(g, &fresh), bi as u32, line, ns));
                         continue;
                     }
-                    let score = have as i64 * 100_000 + potential(g, &ns);
+                    let score = have as i64 * hw + potential(g, &ns);
                     cands.push((score, bi as u32, line, ns));
                 }
             }
