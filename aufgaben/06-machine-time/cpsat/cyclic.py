@@ -28,7 +28,7 @@ def relevant(r, pat):
     return P, F
 
 
-def solve_cyclic(r, pat, L, time_limit, workers=2):
+def solve_cyclic(r, pat, L, time_limit, workers=2, nsub=1):
     """Returns (setup distance, cfgs) or None; cfgs[t][e] = (pos, active)."""
     n = 6 * r
     ry = rays(r)
@@ -79,9 +79,13 @@ def solve_cyclic(r, pat, L, time_limit, workers=2):
         return sum(on[t][e][origin[e][c]] for e in range(6) if c in origin[e] and origin[e][c] in on[t][e])
 
     # matter state per tick, start state (before tick 0) = all relevant cells empty
+    # nsub submissions per cycle at ticks L/nsub*j - 1; after a submission the pattern cells are empty
+    assert L % nsub == 0
+    subticks = {L // nsub * j - 1 for j in range(1, nsub + 1)}
     mat = [[m.NewBoolVar('') for _ in cells] for _ in range(L)]
     for t in range(L):
         for ci, c in enumerate(cells):
+            cleared = t == 0 or ((t - 1) in subticks and ci < npat)
             cnt = count(t, c)
             two = m.NewBoolVar('')
             three = m.NewBoolVar('')
@@ -89,7 +93,7 @@ def solve_cyclic(r, pat, L, time_limit, workers=2):
             m.Add(cnt != 2).OnlyEnforceIf(two.Not())
             m.Add(cnt >= 3).OnlyEnforceIf(three)
             m.Add(cnt <= 2).OnlyEnforceIf(three.Not())
-            if t == 0:
+            if cleared:
                 # previous state empty: matter iff exactly two hits
                 m.Add(mat[t][ci] == two)
             else:
@@ -99,14 +103,13 @@ def solve_cyclic(r, pat, L, time_limit, workers=2):
                 m.AddBoolOr([prev.Not(), three]).OnlyEnforceIf(keep.Not())
                 m.AddBoolOr([two, keep]).OnlyEnforceIf(mat[t][ci])
                 m.AddBoolAnd([two.Not(), keep.Not()]).OnlyEnforceIf(mat[t][ci].Not())
-    # submission exactly at tick L-1, not earlier
-    for ci in range(len(cells)):
-        if ci < npat:
-            m.Add(mat[L - 1][ci] == 1)
+    # submissions exactly at the submission ticks, never elsewhere
+    for t in range(L):
+        if t in subticks:
+            for ci in range(len(cells)):
+                m.Add(mat[t][ci] == (1 if ci < npat else 0))
         else:
-            m.Add(mat[L - 1][ci] == 0)
-    for t in range(L - 1):
-        m.AddBoolOr([mat[t][ci].Not() for ci in range(npat)] + [mat[t][ci] for ci in range(npat, len(cells))])
+            m.AddBoolOr([mat[t][ci].Not() for ci in range(npat)] + [mat[t][ci] for ci in range(npat, len(cells))])
     # secondary objective: setup distance
     h = home(r)
     d = m.NewIntVar(0, n, 'd')
@@ -166,7 +169,7 @@ def build_program(r, cfgs, k, pat):
 
     cyc = [trans(cfgs[t], cfgs[(t + 1) % L]) for t in range(L)]  # cyc[L-1] = C_{L-1} -> C_0
     prog += cyc[:L - 1]
-    for _ in range(k - 1):
+    for _ in range(k):
         prog += [cyc[L - 1]] + cyc[:L - 1]
     subs = simulate(r, pat, prog, k)
     if len(subs) < k:
@@ -186,18 +189,23 @@ def work(args):
     best = old
     pcur = period_of(r, pat, old, k)
     info = ''
-    for L in range(1, min(lmax, pcur - 1) + 1):
-        if L * k >= len(best):
+    for per in range(1, min(lmax, pcur - 1) + 1):
+        if per * k >= len(best):
             break
-        sol = solve_cyclic(r, pat, L, tl)
-        if sol is None:
-            continue
-        prog = build_program(r, sol[1], k, pat)
-        if prog is not None and len(prog) < len(best):
-            assert len(simulate(r, pat, prog, k)) == k
-            best = prog
-            info = f' L={L} (vorher Periode {pcur})'
-        break
+        found = False
+        for nsub in (1, 2):
+            sol = solve_cyclic(r, pat, per * nsub, tl, nsub=nsub)
+            if sol is None:
+                continue
+            found = True
+            prog = build_program(r, sol[1], k, pat)
+            if prog is not None and len(prog) < len(best):
+                assert len(simulate(r, pat, prog, k)) == k
+                best = prog
+                info = f' Periode={per} nsub={nsub} (vorher {pcur})'
+            break
+        if found:
+            break
     return i, best, info
 
 
