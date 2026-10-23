@@ -1,3 +1,5 @@
+mod endgame;
+
 use std::{fs, path::Path};
 
 mod segment;
@@ -354,7 +356,11 @@ fn weight(d: i64, mode: i64) -> i64 {
 }
 
 fn potential(g: &Geometry, st: &St) -> i64 {
-    potential_mode(g, st, POT_MODE.with(|m| *m))
+    potential_mode(g, st, POT_MODE.with(|m| *m), endgame::family_potential())
+}
+
+fn potential_with(g: &Geometry, st: &St, pfam: bool) -> i64 {
+    potential_mode(g, st, POT_MODE.with(|m| *m), pfam)
 }
 
 thread_local! {
@@ -364,7 +370,7 @@ thread_local! {
     static HAVE_W: i64 = env_num("HAVE_W", 100_000);
 }
 
-fn potential_mode(g: &Geometry, st: &St, mode: i64) -> i64 {
+fn potential_mode(g: &Geometry, st: &St, mode: i64, pfam: bool) -> i64 {
     let np = g.pat.len();
     let n = g.n;
     let rows: [&[u8]; 6] = std::array::from_fn(|e| &g.dd[(e * n + st.pos[e] as usize) * np..][..np]);
@@ -386,7 +392,20 @@ fn potential_mode(g: &Geometry, st: &St, mode: i64) -> i64 {
             m1 = lo1;
             m2 = lo2;
         }
-        let d = if m3 == 0 { 3 } else { m2.min(63) };
+        let d = if pfam {
+            // creation needs two different families: second smallest of the per-family minima
+            let f: [u8; 3] = std::array::from_fn(|k| {
+                rows[k][pi].saturating_add(off[k]).min(rows[k + 3][pi].saturating_add(off[k + 3]))
+            });
+            let lo = f[0].min(f[1]).min(f[2]);
+            let hi = f[0].max(f[1]).max(f[2]);
+            let mid = f[0] as u16 + f[1] as u16 + f[2] as u16 - lo as u16 - hi as u16;
+            if hi == 0 { 3 } else { (mid as u8).min(63) }
+        } else if m3 == 0 {
+            3
+        } else {
+            m2.min(63)
+        };
         hist[d as usize] += 1;
     }
     hist.iter().enumerate().map(|(d, &c)| c as i64 * weight(d as i64, mode)).sum()
@@ -412,7 +431,202 @@ fn hash_state(st: &St) -> u64 {
     h
 }
 
+/// Parameters of one beam-search run for a single copy.
+#[derive(Clone)]
+struct BeamParams {
+    width: usize,
+    jw: i64,
+    hw: i64,
+    la: usize,
+    law: i64,
+    la_full: bool,
+    noise: i64,
+    seed: u64,
+    pfam: bool,
+    keep_have: bool, // continue with the pattern cells already present (re-planning from a state)
+}
+
+/// Beam search for one copy starting at `cur` (pattern absent). Returns the lines,
+/// the final state and the number of pattern cells present after every line.
+#[allow(clippy::too_many_arguments)]
+fn search_copy(
+    g: &Geometry,
+    moves: &[[u8; 6]],
+    la_moves: &[[u8; 6]],
+    la_full_moves: &[[u8; 6]],
+    mut cur: St,
+    p: &BeamParams,
+    cnt: &mut [u8],
+    touched: &mut Vec<u16>,
+    configs: Option<&endgame::ConfigList>,
+) -> Option<(Vec<[u8; 6]>, St, Vec<usize>)> {
+    let np = g.pat.len();
+    let n = g.n;
+    let width = p.width;
+    let (jw, hw, la, law, noise) = (p.jw, p.hw, p.la, p.law, p.noise);
+    let la_set = if p.la_full { la_full_moves } else { la_moves };
+    let mut rng: u64 = p.seed.wrapping_mul(0x9E3779B97F4A7C15) ^ (np as u64).wrapping_mul(0x632BE59BD9B4E019) ^ g.pat[0] as u64 ^ 0xA5A5_5A5A;
+    let mut rand = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    if !p.keep_have {
+        cur.have = [0; NW];
+    }
+    let mut nodes: Vec<(u32, [u8; 6], u16)> = vec![(u32::MAX, [b'-'; 6], 0)];
+    let mut beam: Vec<(u32, St)> = vec![(0, cur)];
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(hash_state(&cur));
+    let limit = 40 * np + 400;
+    let mut done: Option<(u32, St)> = None;
+    for _tick in 0..limit {
+        let mut cands: Vec<(i64, u32, [u8; 6], St)> = Vec::new();
+        let mut finished: Vec<(i64, u32, [u8; 6], St)> = Vec::new();
+        for (bi, (_, st)) in beam.iter().enumerate() {
+            for mv in moves {
+                let mut ns = *st;
+                let mut ok = true;
+                for e in 0..6 {
+                    match mv[e] {
+                        0 => ns.pos[e] = ((ns.pos[e] as usize + 1) % n) as u8,
+                        1 => ns.pos[e] = ((ns.pos[e] as usize + n - 1) % n) as u8,
+                        2 => ns.act ^= 1 << e,
+                        _ => {}
+                    }
+                }
+                touched.clear();
+                for e in 0..6 {
+                    if (ns.act >> e) & 1 != 0 {
+                        for &c in &g.ray[e][ns.pos[e] as usize] {
+                            if cnt[c as usize] == 0 {
+                                touched.push(c);
+                            }
+                            cnt[c as usize] += 1;
+                        }
+                    }
+                }
+                for &c in touched.iter() {
+                    let v = cnt[c as usize];
+                    if v == 2 {
+                        if g.forbidden[c as usize] {
+                            if jw == 0 {
+                                ok = false;
+                            } else {
+                                let f = g.f_idx[c as usize] as usize;
+                                ns.junk[f / 64] |= 1 << (f % 64);
+                            }
+                        }
+                        let i = g.pat_idx[c as usize];
+                        if i >= 0 {
+                            ns.have[i as usize / 64] |= 1 << (i as usize % 64);
+                        }
+                    } else if v >= 3 {
+                        if jw != 0 && g.forbidden[c as usize] {
+                            let f = g.f_idx[c as usize] as usize;
+                            ns.junk[f / 64] &= !(1 << (f % 64));
+                        }
+                        let i = g.pat_idx[c as usize];
+                        if i >= 0 {
+                            ns.have[i as usize / 64] &= !(1 << (i as usize % 64));
+                        }
+                    }
+                    cnt[c as usize] = 0;
+                }
+                if !ok {
+                    continue;
+                }
+                let line: [u8; 6] = std::array::from_fn(|e| INSTR[mv[e] as usize]);
+                let have = popcount(&ns.have);
+                let junk: usize = ns.junk.iter().map(|w| w.count_ones() as usize).sum();
+                if have == np && junk == 0 {
+                    let mut fresh = ns;
+                    fresh.have = [0; NW];
+                    finished.push((-potential_with(g, &fresh, p.pfam), bi as u32, line, ns));
+                    continue;
+                }
+                let mut score = have as i64 * hw - junk as i64 * jw + potential_with(g, &ns, p.pfam);
+                if noise > 0 {
+                    score += (rand() % noise as u64) as i64;
+                }
+                cands.push((score, bi as u32, line, ns));
+                if cands.len() >= 8 * width * 16 + 4096 {
+                    let keep = 3 * width * 16;
+                    cands.select_nth_unstable_by(keep, |a, b| b.0.cmp(&a.0));
+                    cands.truncate(keep);
+                }
+            }
+        }
+        if !finished.is_empty() {
+            finished.sort_by_key(|f| f.0);
+            let (_, bi, line, ns) = finished[0];
+            nodes.push((beam[bi as usize].0, line, np as u16));
+            done = Some(((nodes.len() - 1) as u32, ns));
+            break;
+        }
+        cands.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        if let Some(list) = configs {
+            // steer towards reachable configurations that create many missing cells at once
+            let tw = endgame::target_weight();
+            let m = cands.len().min(2 * width);
+            for c in cands[..m].iter_mut() {
+                c.0 += endgame::rate_term(g, list, &c.3) * tw / 100;
+            }
+            cands[..m].sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        }
+        if la > 0 {
+            // re-rank the best candidates by the gain the following line could achieve
+            let m = cands.len().min(la * width);
+            for c in cands[..m].iter_mut() {
+                let gn = endgame::best_next_gain(g, &c.3, la_set, cnt, touched);
+                c.0 += gn as i64 * hw * law / 100;
+            }
+            cands[..m].sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        }
+        let best_have = cands.first().map_or(0, |c| popcount(&c.3.have));
+        let cur_width = endgame::width(width, best_have, np);
+        let mut next: Vec<(u32, St)> = Vec::with_capacity(cur_width);
+        let div = endgame::diversity();
+        let mut per_have: std::collections::HashMap<[u64; NW], usize> = std::collections::HashMap::new();
+        for (_, bi, line, ns) in cands {
+            if next.len() >= cur_width {
+                break;
+            }
+            if div > 0 {
+                let c = per_have.entry(ns.have).or_insert(0);
+                if *c >= div {
+                    continue;
+                }
+                *c += 1;
+            }
+            if !visited.insert(hash_state(&ns)) {
+                continue;
+            }
+            nodes.push((beam[bi as usize].0, line, popcount(&ns.have) as u16));
+            next.push(((nodes.len() - 1) as u32, ns));
+        }
+        if next.is_empty() {
+            return None;
+        }
+        beam = next;
+    }
+    let (mut node, ns) = done?;
+    let mut seq = Vec::new();
+    let mut haves = Vec::new();
+    while node != 0 {
+        seq.push(nodes[node as usize].1);
+        haves.push(nodes[node as usize].2 as usize);
+        node = nodes[node as usize].0;
+    }
+    seq.reverse();
+    haves.reverse();
+    Some((seq, ns, haves))
+}
+
 /// Beam search over all six emitters; builds the pattern `k` times.
+/// With VARIANTS > 1 every copy is searched with several parameter variants and the
+/// shortest copy is kept.
 fn plan_beam(g: &Geometry, r: usize, k: u32, width: usize) -> Option<Vec<[u8; 6]>> {
     plan_beam_from(g, r, k, width, None)
 }
@@ -424,7 +638,6 @@ fn plan_beam_from(g: &Geometry, r: usize, k: u32, width: usize, start: Option<St
     if np > NW * 64 {
         return None;
     }
-    let n = g.n;
     let h = home(r);
     let mut cur = start.unwrap_or(St { pos: std::array::from_fn(|e| h[e] as u8), act: 0, have: [0; NW], junk: [0; NJ] });
     let keep_first = start.is_some();
@@ -448,137 +661,78 @@ fn plan_beam_from(g: &Geometry, r: usize, k: u32, width: usize, start: Option<St
             moves.push(m);
         }
     }
-    let hw = HAVE_W.with(|w| *w);
-    let noise = NOISE.with(|v| *v);
-    // deterministic per-pattern random stream (xorshift)
-    let mut rng: u64 = SEED.with(|v| *v).wrapping_mul(0x9E3779B97F4A7C15) ^ (np as u64 * 0x632BE59BD9B4E019) ^ g.pat[0] as u64 ^ 0xA5A5_5A5A;
-    let mut rand = move || {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        rng
+    let base = BeamParams {
+        width,
+        jw,
+        hw: HAVE_W.with(|w| *w),
+        la: endgame::lookahead_factor(),
+        law: endgame::lookahead_weight(),
+        la_full: false,
+        noise: NOISE.with(|v| *v),
+        seed: SEED.with(|v| *v),
+        pfam: endgame::family_potential(),
+        keep_have: false,
     };
+    let la_moves = endgame::lookahead_moves();
+    let la_full_moves: Vec<[u8; 6]> = moves.clone();
+    let variants = endgame::variants(&base);
+    let configs = (endgame::target_weight() > 0).then(|| endgame::build_configs(g));
     let mut cnt = vec![0u8; g.ncell];
     let mut touched: Vec<u16> = Vec::new();
-    let mut prog: Vec<[u8; 6]> = Vec::new();
-    for copy in 0..k {
-        if copy > 0 || !keep_first {
-            cur.have = [0; NW];
-        }
-        let mut nodes: Vec<(u32, [u8; 6])> = vec![(u32::MAX, [b'-'; 6])];
-        let mut beam: Vec<(u32, St)> = vec![(0, cur)];
-        let mut visited = std::collections::HashSet::new();
-        visited.insert(hash_state(&cur));
-        let limit = 40 * np + 400;
-        let mut done: Option<(u32, St)> = None;
-        for _tick in 0..limit {
-            let mut cands: Vec<(i64, u32, [u8; 6], St)> = Vec::new();
-            let mut finished: Vec<(i64, u32, [u8; 6], St)> = Vec::new();
-            for (bi, (_, st)) in beam.iter().enumerate() {
-                for mv in &moves {
-                    let mut ns = *st;
-                    let mut ok = true;
-                    for e in 0..6 {
-                        match mv[e] {
-                            0 => ns.pos[e] = ((ns.pos[e] as usize + 1) % n) as u8,
-                            1 => ns.pos[e] = ((ns.pos[e] as usize + n - 1) % n) as u8,
-                            2 => ns.act ^= 1 << e,
-                            _ => {}
-                        }
+    if endgame::whole_program_variants() {
+        // every variant builds all k copies on its own; keep the shortest program
+        let mut best: Option<Vec<[u8; 6]>> = None;
+        for v in &variants {
+            let mut st = cur;
+            let mut prog: Vec<[u8; 6]> = Vec::new();
+            let mut ok = true;
+            for copy in 0..k {
+                let mut pv = v.clone();
+                pv.seed = pv.seed.wrapping_add(copy as u64 * 7919);
+                pv.keep_have = copy == 0 && keep_first;
+                match search_copy(g, &moves, &la_moves, &la_full_moves, st, &pv, &mut cnt, &mut touched, configs.as_ref()) {
+                    Some((seq, ns, _)) => {
+                        prog.extend(seq);
+                        st = ns;
                     }
-                    touched.clear();
-                    for e in 0..6 {
-                        if (ns.act >> e) & 1 != 0 {
-                            for &c in &g.ray[e][ns.pos[e] as usize] {
-                                if cnt[c as usize] == 0 {
-                                    touched.push(c);
-                                }
-                                cnt[c as usize] += 1;
-                            }
-                        }
-                    }
-                    for &c in &touched {
-                        let v = cnt[c as usize];
-                        if v == 2 {
-                            if g.forbidden[c as usize] {
-                                if jw == 0 {
-                                    ok = false;
-                                } else {
-                                    let f = g.f_idx[c as usize] as usize;
-                                    ns.junk[f / 64] |= 1 << (f % 64);
-                                }
-                            }
-                            let i = g.pat_idx[c as usize];
-                            if i >= 0 {
-                                ns.have[i as usize / 64] |= 1 << (i as usize % 64);
-                            }
-                        } else if v >= 3 {
-                            if jw != 0 && g.forbidden[c as usize] {
-                                let f = g.f_idx[c as usize] as usize;
-                                ns.junk[f / 64] &= !(1 << (f % 64));
-                            }
-                            let i = g.pat_idx[c as usize];
-                            if i >= 0 {
-                                ns.have[i as usize / 64] &= !(1 << (i as usize % 64));
-                            }
-                        }
-                        cnt[c as usize] = 0;
-                    }
-                    if !ok {
-                        continue;
-                    }
-                    let line: [u8; 6] = std::array::from_fn(|e| INSTR[mv[e] as usize]);
-                    let have = popcount(&ns.have);
-                    let junk: usize = ns.junk.iter().map(|w| w.count_ones() as usize).sum();
-                    if have == np && junk == 0 {
-                        let mut fresh = ns;
-                        fresh.have = [0; NW];
-                        finished.push((-potential(g, &fresh), bi as u32, line, ns));
-                        continue;
-                    }
-                    let mut score = have as i64 * hw - junk as i64 * jw + potential(g, &ns);
-                    if noise > 0 {
-                        score += (rand() % noise as u64) as i64;
-                    }
-                    cands.push((score, bi as u32, line, ns));
-                    if cands.len() >= 8 * width + 4096 {
-                        let keep = 3 * width;
-                        cands.select_nth_unstable_by(keep, |a, b| b.0.cmp(&a.0));
-                        cands.truncate(keep);
+                    None => {
+                        ok = false;
+                        break;
                     }
                 }
-            }
-            if !finished.is_empty() {
-                finished.sort_by_key(|f| f.0);
-                let (_, bi, line, ns) = finished[0];
-                nodes.push((beam[bi as usize].0, line));
-                done = Some(((nodes.len() - 1) as u32, ns));
-                break;
-            }
-            cands.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            let mut next: Vec<(u32, St)> = Vec::with_capacity(width);
-            for (_, bi, line, ns) in cands {
-                if next.len() >= width {
+                if best.as_ref().is_some_and(|b| prog.len() >= b.len()) {
+                    ok = false;
                     break;
                 }
-                if !visited.insert(hash_state(&ns)) {
-                    continue;
+            }
+            if ok {
+                best = Some(prog);
+            }
+        }
+        return best;
+    }
+    let mut prog: Vec<[u8; 6]> = Vec::new();
+    for copy in 0..k {
+        let mut best: Option<(Vec<[u8; 6]>, St, Vec<usize>, i64)> = None;
+        for v in &variants {
+            let mut pv = v.clone();
+            pv.seed = pv.seed.wrapping_add(copy as u64 * 7919);
+            pv.keep_have = copy == 0 && keep_first;
+            if let Some((seq, ns, haves)) = search_copy(g, &moves, &la_moves, &la_full_moves, cur, &pv, &mut cnt, &mut touched, configs.as_ref()) {
+                let mut fresh = ns;
+                fresh.have = [0; NW];
+                let pot = potential(g, &fresh);
+                let better = match &best {
+                    None => true,
+                    Some((b, _, _, bp)) => seq.len() < b.len() || (seq.len() == b.len() && pot > *bp),
+                };
+                if better {
+                    best = Some((seq, ns, haves, pot));
                 }
-                nodes.push((beam[bi as usize].0, line));
-                next.push(((nodes.len() - 1) as u32, ns));
             }
-            if next.is_empty() {
-                return None;
-            }
-            beam = next;
         }
-        let (mut node, ns) = done?;
-        let mut seq = Vec::new();
-        while node != 0 {
-            seq.push(nodes[node as usize].1);
-            node = nodes[node as usize].0;
-        }
-        seq.reverse();
+        let (seq, ns, haves, _) = best?;
+        endgame::record_copy(&haves, np);
         prog.extend(seq);
         cur = ns;
     }
@@ -723,6 +877,9 @@ fn parse_programs(text: &str) -> Vec<Vec<[u8; 6]>> {
 /// Exact search for a building cycle of length <= 2 (line-space enumeration).
 /// Returns (length, configs) where a config gives per emitter `None` (off) or a ring position.
 fn min_cycle(r: usize, pattern: &[Vec<u8>]) -> Option<(usize, Vec<[Option<u8>; 6]>)> {
+    if std::env::var("NOCYCLE").is_ok() {
+        return None;
+    }
     let g = geometry(r, pattern);
     let np = g.pat.len();
     if np > 64 || g.nf > 128 {
@@ -944,7 +1101,7 @@ fn cycle_program(r: usize, cfgs: &[[Option<u8>; 6]], k: u32) -> Vec<[u8; 6]> {
 
 /// Simulate a program prefix; returns (search state, submissions so far) or None if
 /// forbidden cells hold matter (the beam search cannot continue from such states).
-fn state_after(r: usize, pattern: &[Vec<u8>], g: &Geometry, prog: &[[u8; 6]]) -> Option<(St, usize)> {
+fn state_after(r: usize, _pattern: &[Vec<u8>], g: &Geometry, prog: &[[u8; 6]]) -> Option<(St, usize)> {
     let mut grid = empty_board(r);
     let ring = ring(r);
     let n = ring.len();
@@ -1163,6 +1320,17 @@ fn solve(input: &str, existing: Option<Vec<Vec<[u8; 6]>>>) -> (String, usize) {
 }
 
 fn main() {
+    if std::env::var("ANALYZE2").is_ok() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("daten");
+        let f = std::env::var("ANALYZE2").unwrap();
+        let tasks = parse(&fs::read_to_string(dir.join(f)).unwrap());
+        for t in tasks.iter().take(env_num("LIMIT", 12) as usize) {
+            let g = geometry(t.r, &t.pattern);
+            let hist = endgame::config_histogram(&g);
+            println!("R={} np={} k={} max={} hist(>=6..)={:?}", t.r, g.pat.len(), t.k, hist.len() - 1, &hist[6.min(hist.len())..]);
+        }
+        return;
+    }
     if std::env::var("ANALYZE").is_ok() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("daten");
         for f in ["in_level-6_2-medium.txt"] {
@@ -1220,6 +1388,7 @@ fn main() {
                 fs::write(out_dir.join(format!("out_{rest}")), res).unwrap();
             }
             println!("{name}: ok, Zeilen gesamt = {total}");
+            endgame::report();
         }
     }
 }
