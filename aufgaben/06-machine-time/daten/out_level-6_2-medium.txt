@@ -5485,19 +5485,18 @@ B F F B F B
 B - - B F F
 B - - F - T
 
-B T T B - -
-T F B B T T
-F F - T F B
-- F F F F -
-B B B T F B
-B B B T F -
-B B B - F -
-- - - - - -
-F F F - B F
-F F F T B B
-F F F B B F
-- B B T B -
-B - F F B B
+B B B B B B
+B B - - - -
+T T T T T T
+F F - - B B
+F - - B - F
+- F B B B B
+B - - F T B
+F - - B T F
+B - F F F T
+- B B - F F
+B B F F - T
+B F B B F -
 
 T - T - F F
 B T B - T -
