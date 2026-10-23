@@ -3,6 +3,7 @@ mod endgame;
 use std::{fs, path::Path};
 
 mod segment;
+mod extbeam;
 
 const DIRS: [(i64, i64); 6] = [(0, 2), (1, 1), (1, -1), (0, -2), (-1, -1), (-1, 1)];
 const NEIGHBORS: [(i64, i64); 6] = [(0, 2), (0, -2), (1, 1), (1, -1), (-1, 1), (-1, -1)];
@@ -1220,6 +1221,22 @@ fn generate(r: usize, pattern: &[Vec<u8>], k: u32, width: usize) -> Vec<[u8; 6]>
         }
         if let Some(p) = best.as_ref().and_then(|b| segment::reuse_best_copy(r, pattern, k, b)) {
             best = Some(p);
+        }
+    }
+    let extw = env_num("EXTW", 0) as usize;
+    if extw > 0 {
+        let params = extbeam::Params {
+            width: extw,
+            wa: env_num("WA", 100),
+            wd: env_num("WD", 30),
+            noise: env_num("NZ", 0) as u64,
+            seed: env_num("SEED", 0) as u64,
+            maxt: env_num("MAXT", 600) as usize,
+        };
+        if let Some(p) = extbeam::plan(&g, r, k, &params) {
+            if simulate(r, pattern, &p) == k && best.as_ref().map_or(true, |x| p.len() < x.len()) {
+                best = Some(p);
+            }
         }
     }
     best.expect("no program found")
